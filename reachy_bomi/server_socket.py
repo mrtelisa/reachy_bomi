@@ -20,6 +20,7 @@ from reachy_bomi.scenarios import SCENARIO_IDS, resolve_script_for_scenario
 current_dir = os.path.dirname(os.path.abspath(__file__))
 
 # SOCKET CONFIGURATION
+# TODO: control the correct IP adress
 HEADER = 64
 PORT = 5051
 # Dynamic IP
@@ -117,13 +118,6 @@ class ServerSocketNode(Node):
             # Mapping scenarios (Bash scripts)
             for scenario_name, scenario_id in SCENARIO_IDS.items():
                 if scenario_name in msg:
-                    script = resolve_script_for_scenario(scenario_name)
-                    
-                    if Path(script).exists():
-                        subprocess.Popen(['/bin/bash', script])
-                    else:
-                        self.get_logger().error(f"Script not found: {script}")
-
                     self.map_name = scenario_id
                     self.map_name_pub.publish(Float32(data=self.map_name))
                     self.get_logger().info(f"Starting scenario {scenario_name}")
@@ -135,7 +129,7 @@ class ServerSocketNode(Node):
                 self.base_state = 0.0
 
         except Exception as e:
-            self.get_logger().error(f"Errore decodifica: {e}")
+            self.get_logger().error(f"Decodification error: {e}")
 
 
 # --- SOCKET LOGIC ---
@@ -179,7 +173,7 @@ def main():
             client_thread.start()
             print(f"[ACTIVE CONNECTIONS] {threading.activeCount() - 2}")
     except KeyboardInterrupt:
-        print("[SHUTTING DOWN] Server in chiusura...")
+        print("[SHUTTING DOWN] Server closing...")
     finally:
         node.destroy_node()
         rclpy.shutdown()

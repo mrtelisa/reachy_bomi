@@ -1,3 +1,25 @@
 scenarios:
   familiarization:
-    world: worlds/base.world
+    world: worlds/familiarization.world
+  train1:
+    world: worlds/labyrinth1.world
+  train2:
+    world: worlds/labyrinth1.world
+  train3:
+    world: worlds/labyrinth1.world
+  train4:
+    world: worlds/labyrinth1.world
+  test1:
+    world: worlds/mid_tests.world
+  train5:
+    world: worlds/labyrinth2.world
+  train6:
+    world: worlds/labyrinth2.world
+  train7:
+    world: worlds/labyrinth2.world
+  train8:
+    world: worlds/labyrinth2.world
+  test2:
+    world: worlds/mid_tests.world
+  final_test:
+    world: worlds/final_test.world

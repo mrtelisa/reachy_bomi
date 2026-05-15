@@ -6,6 +6,17 @@ from ament_index_python.packages import get_package_share_directory
 
 SCENARIO_IDS = {
     "familiarization": 1.0,
+    "train1": 2.0,
+    "train2": 3.0,
+    "train3": 4.0,
+    "train4": 5.0,
+    "test1": 6.0,
+    "train5": 7.0,
+    "train6": 8.0,
+    "train7": 9.0,
+    "train8": 10.0,
+    "test2": 11.0,
+    "final_test": 12.0,
 }
 
 SCENARIO_NAMES = tuple(SCENARIO_IDS.keys())
@@ -38,7 +49,3 @@ def resolve_world_for_scenario(scenario_name: str) -> str:
         world_path = get_share_dir() / world_path
 
     return str(world_path.resolve())
-
-def resolve_script_for_scenario(scenario_name: str) -> str:
-    script_path = get_share_dir() / "sh_files" / f"{scenario_name}.sh"
-    return str(script_path)
