@@ -9,6 +9,15 @@ from std_msgs.msg import Float32
 #from nav2_msgs.action import NavigateToPose
 import math
 
+# Map limits (x_min, x_max, y_min, y_max) per world, from world file bounding boxes
+WORLD_LIMITS = {
+    "familiarization": (-10.1,  10.15, -7.15,  6.2),
+    "labyrinth1":      (-1.12,  21.13, -2.23,  6.84),
+    "labyrinth2":      (-1.31,  19.94, -2.29,  5.97),
+    "mid_tests":       (-10.4,  10.43, -6.68,  5.68),
+    "final_test":      (-4.05,  20.95, -1.56,  15.64),
+}
+
 class ServerData(Node):
     """
     This class is used to share variables between functions
@@ -78,13 +87,20 @@ class ServerData(Node):
         Once the name of the map is received, this function stores the values of the map
         """
         if not self.already_acquired_map_name:
-            # Extract the name of the map update the min and max values
-            if msg.data == 1.0:
-                self.x_min, self.x_max, self.y_min, self.y_max = -4.35, 4.35, -12.36, 1.32
-            elif msg.data == 2.0:
-                self.x_min, self.x_max, self.y_min, self.y_max = -4.25, 4.25, -4.2, 9.3
-            elif msg.data == 3.0: # real Reachy
-                self.x_min, self.x_max, self.y_min, self.y_max = -500, 500, -500, 500
+            if msg.data == 1.0:                         # familiarization
+                limits = WORLD_LIMITS["familiarization"]
+            elif msg.data in (2.0, 3.0, 4.0, 5.0):     # train1-4 (labyrinth1)
+                limits = WORLD_LIMITS["labyrinth1"]
+            elif msg.data in (6.0, 11.0):               # test1, test2 (mid_tests)
+                limits = WORLD_LIMITS["mid_tests"]
+            elif msg.data in (7.0, 8.0, 9.0, 10.0):    # train5-8 (labyrinth2)
+                limits = WORLD_LIMITS["labyrinth2"]
+            elif msg.data == 12.0:                      # final_test
+                limits = WORLD_LIMITS["final_test"]
+            else:
+                limits = None
+            if limits is not None:
+                self.x_min, self.x_max, self.y_min, self.y_max = limits
             self.already_acquired_map_name = True
             self.get_logger().info(f"Map Limits Acquired: X[{self.x_min}:{self.x_max}]")
 

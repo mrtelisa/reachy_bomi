@@ -15,7 +15,7 @@ from std_msgs.msg import Float32, Int32
 from pathlib import Path
 
 from ament_index_python.packages import get_package_share_directory
-from reachy_bomi.scenarios import SCENARIO_IDS, resolve_script_for_scenario 
+from reachy_bomi.scenarios import SCENARIO_IDS 
 
 current_dir = os.path.dirname(os.path.abspath(__file__))
 
