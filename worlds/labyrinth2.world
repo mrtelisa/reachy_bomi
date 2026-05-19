@@ -1,5 +1,6 @@
+<?xml version='1.0'?>
 <sdf version='1.6'>
-  <world name='labyrinth2'>
+  <world name='default'>
     <light name='sun' type='directional'>
       <cast_shadows>1</cast_shadows>
       <pose frame=''>0 0 10 0 -0 0</pose>
@@ -85,7 +86,7 @@
       <elevation>0</elevation>
       <heading_deg>0</heading_deg>
     </spherical_coordinates>
-    <model name='labyrinth2'>
+    <model name='train22'>
       <pose frame=''>9.31874 1.84353 0 0 -0 0</pose>
       <link name='Wall_0'>
         <collision name='Wall_0_Collision'>
@@ -127,7 +128,7 @@
             <layer>0</layer>
           </meta>
         </visual>
-        <pose frame=''>-0 -4.04548 0 0 -0 0</pose>
+        <pose frame=''>0 -4.04548 0 0 -0 0</pose>
         <self_collide>0</self_collide>
         <enable_wind>0</enable_wind>
         <kinematic>0</kinematic>
@@ -397,7 +398,7 @@
             <layer>0</layer>
           </meta>
         </visual>
-        <pose frame=''>-0 4.05452 0 0 -0 3.14159</pose>
+        <pose frame=''>0 4.05452 0 0 -0 3.14159</pose>
         <self_collide>0</self_collide>
         <enable_wind>0</enable_wind>
         <kinematic>0</kinematic>
