@@ -1,11 +1,16 @@
+import datetime
+import os
+
 from launch import LaunchDescription
-from launch.actions import DeclareLaunchArgument, IncludeLaunchDescription, OpaqueFunction
+from launch.actions import DeclareLaunchArgument, ExecuteProcess, IncludeLaunchDescription, OpaqueFunction
 from launch.launch_description_sources import PythonLaunchDescriptionSource
 from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
 from launch_ros.substitutions import FindPackageShare
 
-from reachy_bomi.scenarios import SCENARIO_NAMES, resolve_world_for_scenario
+from reachy_bomi.scenarios import SCENARIO_NAMES, resolve_world_for_scenario, resolve_bag_prefix_for_scenario
+
+BAG_OUTPUT_DIR = os.path.expanduser("~/reachy_bomi_bags")
 
 
 def launch_setup(context, *args, **kwargs):
@@ -13,6 +18,11 @@ def launch_setup(context, *args, **kwargs):
     start_rviz = LaunchConfiguration("start_rviz")
 
     world = resolve_world_for_scenario(scenario)
+
+    bag_prefix = resolve_bag_prefix_for_scenario(scenario)
+    timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    bag_output = os.path.join(BAG_OUTPUT_DIR, f"{bag_prefix}_{timestamp}")
+    os.makedirs(BAG_OUTPUT_DIR, exist_ok=True)
 
     reachy_sim = IncludeLaunchDescription(
         PythonLaunchDescriptionSource(
@@ -40,10 +50,21 @@ def launch_setup(context, *args, **kwargs):
         output="screen",
     )
 
+    bag_record = ExecuteProcess(
+        cmd=[
+            "ros2", "bag", "record",
+            "-o", bag_output,
+            "/tf", "/odom", "/cmd_vel", "/scan", "/amcl_pose",
+            "/reachy/contacts_state",
+        ],
+        output="screen",
+    )
+
     return [
         reachy_sim,
         server_socket_node,
         cmd_vel_publisher_node,
+        bag_record,
     ]
 
 def generate_launch_description():
