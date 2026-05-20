@@ -2,57 +2,48 @@
 
 import socket
 import threading
-import numpy as np
-import os
-import subprocess
-import time
+from dataclasses import dataclass
 
-# ROS 2 LIBRARIES
 import rclpy
 from rclpy.node import Node
-from geometry_msgs.msg import Twist, Point
 from std_msgs.msg import Float32, Int32
-from pathlib import Path
 
-from ament_index_python.packages import get_package_share_directory
-from reachy_bomi.scenarios import SCENARIO_IDS 
+from reachy_bomi.scenarios import SCENARIO_IDS
 
-current_dir = os.path.dirname(os.path.abspath(__file__))
-
-# SOCKET CONFIGURATION
-# TODO: control the correct IP adress
 HEADER = 64
 PORT = 5051
-# Dynamic IP
-try:
-    SERVER = socket.gethostbyname(socket.gethostname())
-except:
-    SERVER = '127.0.0.1' 
-ADDR = (SERVER, PORT)
-FORMAT = 'utf-8'
+FORMAT = "utf-8"
 DISCONNECT_MESSAGE = "!DISCONNECT"
 
+
+def get_local_ip() -> str:
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        sock.connect(("8.8.8.8", 53))
+        return sock.getsockname()[0]
+    finally:
+        sock.close()
+
+
+@dataclass
+class ServerState:
+    linear_vel: float = 0.0
+    angular_vel: float = 0.0
+    x_coordinate: float = 0.0
+    y_coordinate: float = 0.0
+    map_name: float = 0.0
+    base_state: float = -1.0
+    vector_angle: int = 0
+    vector_amplitude: int = 0
+
+
 class ServerSocketNode(Node):
-    """
-    ROS2 node that handles Publishers and recieved data from Socket
-    """
-    def __init__(self):
-        super().__init__('server_socket_node')
+    def __init__(self) -> None:
+        super().__init__("server_socket_node")
+        self.declare_parameter("port", PORT)
+        self.port = self.get_parameter("port").get_parameter_value().integer_value
+        self.state = ServerState()
 
-        # --- State variables ---
-        self.linear_vel = 0.0
-        self.angular_vel = 0.0
-        self.x_coordinate = 0.0
-        self.y_coordinate = 0.0
-        self.base_state = -1.0
-        self.map_name = None
-        self.vector_angle = 0
-        self.vector_amplitude = 0
-        
-        self.send_coordinates = False
-        self.send_vector_info = False
-
-        # --- PUBLISHERS ---
         self.linear_vel_pub = self.create_publisher(Float32, "server_socket/linear_vel", 10)
         self.ang_vel_pub = self.create_publisher(Float32, "server_socket/angular_vel", 10)
         self.x_coor_pub = self.create_publisher(Float32, "server_socket/x_coordinate", 10)
@@ -62,121 +53,95 @@ class ServerSocketNode(Node):
         self.amplitude_vector_pub = self.create_publisher(Int32, "server_socket/vector_amplitude", 10)
         self.angle_vector_pub = self.create_publisher(Int32, "server_socket/vector_angle", 10)
 
-        # --- TIMER LOOP (20Hz) ---
-        self.timer = self.create_timer(0.05, self.publish_loop)
-        self.get_logger().info(f"ROS 2 Server Node avviato su IP: {SERVER}")
+        local_ip = get_local_ip()
+        self.server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.server.bind((local_ip, self.port))
+        self.server.listen()
+        self.get_logger().info(f"Socket server listening on {local_ip}:{self.port}")
 
+        self.thread = threading.Thread(target=self._accept_loop, daemon=True)
+        self.thread.start()
 
-    def publish_loop(self):
-        # Continously publishing base state
-        self.base_state_pub.publish(Float32(data=float(self.base_state)))
+    def _accept_loop(self) -> None:
+        while rclpy.ok():
+            conn, addr = self.server.accept()
+            self.get_logger().info(f"New connection from {addr}")
+            thread = threading.Thread(target=self._handle_client, args=(conn,), daemon=True)
+            thread.start()
 
-        # Nine Region GUI
-        if self.base_state == 1.0:
-            self.linear_vel_pub.publish(Float32(data=self.linear_vel))
-            self.ang_vel_pub.publish(Float32(data=self.angular_vel))
-            self.get_logger().info("Velocities published")
-
-        # Odom GUI (Coordinates)
-        elif self.base_state == 0.0 and self.send_coordinates:
-            self.x_coor_pub.publish(Float32(data=self.x_coordinate))
-            self.y_coor_pub.publish(Float32(data=self.y_coordinate))
-            self.send_coordinates = False
-            self.get_logger().info("Coordinates published")
-
-
-    def decode_msg(self, msg):
-        """
-        Function used to decode the msg sent by the socket client
-        :param
-            msg: string received by client
-        """
-        try:
-            if 'lin_vel:' in msg:
-                # ex: "lin_vel:0.5"
-                val = msg.split('lin_vel:')[1][:4]
-                self.linear_vel = float(val)
-
-            if 'ang_vel:' in msg:
-                val = msg.split('ang_vel:')[1][:4]
-                self.angular_vel = float(val)
-
-            if "angle" in msg:
-            # Extract amplitude and angle of the 2D vector
-                parts = msg.split(" ")
-                self.vector_angle = int(parts[1])
-                self.vector_amplitude = int(parts[3])
-                self.send_vector_info = True
-
-            # Check for target position for odom GUI
-            if 'x:' in msg:
-                self.x_coordinate = float(msg.split('x:')[1].split()[0])
-            if 'y:' in msg:
-                self.y_coordinate = float(msg.split('y:')[1].split()[0])
-                self.send_coordinates = True
-
-            # Mapping scenarios (Bash scripts)
-            for scenario_name, scenario_id in SCENARIO_IDS.items():
-                if scenario_name in msg:
-                    self.map_name = scenario_id
-                    self.map_name_pub.publish(Float32(data=self.map_name))
-                    self.get_logger().info(f"Starting scenario {scenario_name}")
-
-            # Check and update the state of the base
-            if "nine region" in msg:
-                self.base_state = 1.0
-            elif "odom" in msg:
-                self.base_state = 0.0
-
-        except Exception as e:
-            self.get_logger().error(f"Decodification error: {e}")
-
-
-# --- SOCKET LOGIC ---
-def handle_client(conn, addr, node):
-    print(f"[NEW CONNECTION] {addr} connected.")
-    connected = True
-    while connected:
-        try:
-            msg = conn.recv(1024).decode(FORMAT)
-            if not msg: break
-            
-            node.decode_msg(msg)
-            
+    def _handle_client(self, conn: socket.socket) -> None:
+        connected = True
+        while connected and rclpy.ok():
+            data = conn.recv(1024)
+            if not data:
+                break
+            msg = data.decode(FORMAT).strip()
+            self._decode_msg(msg)
             if msg == DISCONNECT_MESSAGE:
                 connected = False
-            print(f"[{addr}] {msg}")
-        except:
-            break
-    conn.close()
+        conn.close()
+
+    def _decode_msg(self, msg: str) -> None:
+        if "lin_vel:" in msg:
+            self.state.linear_vel = self._extract_float(msg, "lin_vel:")
+            self.linear_vel_pub.publish(Float32(data=self.state.linear_vel))
+
+        if "ang_vel:" in msg:
+            self.state.angular_vel = self._extract_float(msg, "ang_vel:")
+            self.ang_vel_pub.publish(Float32(data=self.state.angular_vel))
+
+        if "x:" in msg:
+            self.state.x_coordinate = self._extract_float(msg, "x:")
+            self.x_coor_pub.publish(Float32(data=self.state.x_coordinate))
+
+        if "y:" in msg:
+            self.state.y_coordinate = self._extract_float(msg, "y:")
+            self.y_coor_pub.publish(Float32(data=self.state.y_coordinate))
+
+        if "angle" in msg and "amplitude" in msg:
+            parts = msg.split()
+            try:
+                angle_idx = parts.index("angle")
+                amp_idx = parts.index("amplitude")
+                self.state.vector_angle = int(parts[angle_idx + 1])
+                self.state.vector_amplitude = int(parts[amp_idx + 1])
+                self.angle_vector_pub.publish(Int32(data=self.state.vector_angle))
+                self.amplitude_vector_pub.publish(Int32(data=self.state.vector_amplitude))
+            except (ValueError, IndexError):
+                self.get_logger().warning(f"Cannot decode vector message: {msg}")
+
+        for scenario_name, scenario_id in SCENARIO_IDS.items():
+            if scenario_name in msg:
+                self.state.map_name = float(scenario_id)
+                self.map_name_pub.publish(Float32(data=self.state.map_name))
+                self.get_logger().info(f"Scenario: {scenario_name}")
+
+        if "nine region" in msg:
+            self.state.base_state = 1.0
+            self.base_state_pub.publish(Float32(data=self.state.base_state))
+        elif "odom" in msg:
+            self.state.base_state = 0.0
+            self.base_state_pub.publish(Float32(data=self.state.base_state))
+
+    @staticmethod
+    def _extract_float(message: str, key: str) -> float:
+        start = message.find(key)
+        if start < 0:
+            return 0.0
+        payload = message[start + len(key):].split()[0]
+        return float(payload)
 
 
-def main():
-    # ROS2 initialization
+def main() -> None:
     rclpy.init()
     node = ServerSocketNode()
-
-    # Starting Socket Server
-    server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    server_socket.bind(ADDR)
-    server_socket.listen()
-    print(f"[LISTENING] Server is listening on {SERVER}")
-
-    # Starting ROS2 in a separate thread 
-    ros_thread = threading.Thread(target=lambda: rclpy.spin(node), daemon=True)
-    ros_thread.start()
-
     try:
-        while True:
-            conn, addr = server_socket.accept()
-            client_thread = threading.Thread(target=handle_client, args=(conn, addr, node))
-            client_thread.start()
-            print(f"[ACTIVE CONNECTIONS] {threading.activeCount() - 2}")
-    except KeyboardInterrupt:
-        print("[SHUTTING DOWN] Server closing...")
+        rclpy.spin(node)
     finally:
+        node.server.close()
         node.destroy_node()
         rclpy.shutdown()
 
-if __name__ == '__main__':
+
+if __name__ == "__main__":
     main()
