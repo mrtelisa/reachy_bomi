@@ -6,11 +6,8 @@ from dataclasses import dataclass
 
 import rclpy
 from rclpy.node import Node
-from std_msgs.msg import Float32, Int32
+from std_msgs.msg import Float32
 
-from reachy_bomi.scenarios import SCENARIO_IDS
-
-HEADER = 64
 PORT = 5051
 FORMAT = "utf-8"
 DISCONNECT_MESSAGE = "!DISCONNECT"
@@ -29,12 +26,7 @@ def get_local_ip() -> str:
 class ServerState:
     linear_vel: float = 0.0
     angular_vel: float = 0.0
-    x_coordinate: float = 0.0
-    y_coordinate: float = 0.0
-    map_name: float = 0.0
     base_state: float = -1.0
-    vector_angle: int = 0
-    vector_amplitude: int = 0
 
 
 class ServerSocketNode(Node):
@@ -46,12 +38,7 @@ class ServerSocketNode(Node):
 
         self.linear_vel_pub = self.create_publisher(Float32, "server_socket/linear_vel", 10)
         self.ang_vel_pub = self.create_publisher(Float32, "server_socket/angular_vel", 10)
-        self.x_coor_pub = self.create_publisher(Float32, "server_socket/x_coordinate", 10)
-        self.y_coor_pub = self.create_publisher(Float32, "server_socket/y_coordinate", 10)
-        self.map_name_pub = self.create_publisher(Float32, "server_socket/map_name", 10)
         self.base_state_pub = self.create_publisher(Float32, "server_socket/base_state", 10)
-        self.amplitude_vector_pub = self.create_publisher(Int32, "server_socket/vector_amplitude", 10)
-        self.angle_vector_pub = self.create_publisher(Int32, "server_socket/vector_angle", 10)
 
         local_ip = get_local_ip()
         self.server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -90,37 +77,8 @@ class ServerSocketNode(Node):
             self.state.angular_vel = self._extract_float(msg, "ang_vel:")
             self.ang_vel_pub.publish(Float32(data=self.state.angular_vel))
 
-        if "x:" in msg:
-            self.state.x_coordinate = self._extract_float(msg, "x:")
-            self.x_coor_pub.publish(Float32(data=self.state.x_coordinate))
-
-        if "y:" in msg:
-            self.state.y_coordinate = self._extract_float(msg, "y:")
-            self.y_coor_pub.publish(Float32(data=self.state.y_coordinate))
-
-        if "angle" in msg and "amplitude" in msg:
-            parts = msg.split()
-            try:
-                angle_idx = parts.index("angle")
-                amp_idx = parts.index("amplitude")
-                self.state.vector_angle = int(parts[angle_idx + 1])
-                self.state.vector_amplitude = int(parts[amp_idx + 1])
-                self.angle_vector_pub.publish(Int32(data=self.state.vector_angle))
-                self.amplitude_vector_pub.publish(Int32(data=self.state.vector_amplitude))
-            except (ValueError, IndexError):
-                self.get_logger().warning(f"Cannot decode vector message: {msg}")
-
-        for scenario_name, scenario_id in SCENARIO_IDS.items():
-            if scenario_name in msg:
-                self.state.map_name = float(scenario_id)
-                self.map_name_pub.publish(Float32(data=self.state.map_name))
-                self.get_logger().info(f"Scenario: {scenario_name}")
-
         if "nine region" in msg:
             self.state.base_state = 1.0
-            self.base_state_pub.publish(Float32(data=self.state.base_state))
-        elif "odom" in msg:
-            self.state.base_state = 0.0
             self.base_state_pub.publish(Float32(data=self.state.base_state))
 
     @staticmethod

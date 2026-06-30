@@ -12,9 +12,7 @@ setup(
         ('share/' + package_name, ['package.xml']),
         ('share/' + package_name + '/launch', glob('launch/*.launch.py')),
         ('share/' + package_name + '/config', glob('config/*.yaml')),
-        ('share/' + package_name + '/sh_files', glob('sh_files/*.sh')),
         ('share/' + package_name + '/worlds', glob('worlds/*.world')),
-        
     ],
     install_requires=['setuptools'],
     zip_safe=True,
@@ -22,7 +20,6 @@ setup(
     maintainer_email='s6504193@studenti.unige.it',
     description='ROS 2 package for BoMI finger input to Reachy velocity commands',
     license='TODO: License declaration',
-    tests_require=['pytest'],
     entry_points={
         'console_scripts': [
             'server_socket = reachy_bomi.server_socket:main',
