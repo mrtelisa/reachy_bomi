@@ -63,8 +63,7 @@ def launch_setup(context, *args, **kwargs):
                 "ros2", "bag", "record",
                 "--storage", "mcap",
                 "-o", bag_output,
-                "/tf", "/odom", "/cmd_vel", "/scan", "/amcl_pose",
-                "/reachy/contacts_state",
+                "/tf", "/odom", "/cmd_vel", "/scan",
             ],
             output="screen",
         )

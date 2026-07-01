@@ -157,11 +157,16 @@ The tools in `scripts/` inspect a recorded bag **after** a run; they are standal
 - `trajectory_map_collisions.py` — plot the trajectory (and collisions, if available).
 - `export_collision_events_csv.py` — export collision events to CSV.
 
+Collisions are estimated using the `/scan` topic.
+
 Run them directly, e.g.:
 
 ```bash
 python3 scripts/extract_path.py ~/reachy_bomi_bags/Familiarization_<timestamp> path.csv
 ```
+
+## TODOs
+- Evaluate if it makes sense to implement a mechanism of collision evaluation using the `/odom` topic together with the `/scan` one 
 
 ## Known limitations
 - The client and the robot side must be reachable on the same network; there is no automatic discovery — you pass the robot IP to the client manually.

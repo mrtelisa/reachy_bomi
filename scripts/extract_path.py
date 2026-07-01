@@ -1,19 +1,16 @@
 #!/usr/bin/env python3
 """
-Extract robot path from a ROS2 bag file and save it as CSV.
+Extract the robot path from a ROS 2 bag file and save it as CSV.
 
 Usage:
-    python extract_path1.py <bag_dir> <output_csv> [pose_topic]
+    python3 extract_path.py <bag_dir> [output_csv] [options]
 
-    pose_topic  default: /odom
-                Use /amcl_pose if Nav2 localization is running.
-
-Both nav_msgs/msg/Odometry (/odom) and
-geometry_msgs/msg/PoseWithCovarianceStamped (/amcl_pose) are supported
-since both expose the same msg.pose.pose.position / orientation fields.
+If output_csv is omitted, the file is written in the current 
+working directory.
 """
-import sys
+import argparse
 import csv
+import os
 
 from tf_transformations import euler_from_quaternion
 import rosbag2_py
@@ -30,30 +27,34 @@ def _open_reader(bag_path: str) -> rosbag2_py.SequentialReader:
     return reader
 
 
+def _bag_name(bag_dir: str) -> str:
+    """Full bag directory name, e.g. 'Train1_20260520_143021'."""
+    return os.path.basename(bag_dir.rstrip('/'))
+
+
 def main():
-    if len(sys.argv) < 3:
-        print("Usage: extract_path1.py <bag_dir> <output_csv> [pose_topic]")
-        print("  pose_topic default: /odom")
-        sys.exit(1)
+    parser = argparse.ArgumentParser(description="Extract robot path from a ROS 2 bag to CSV.")
+    parser.add_argument("bag_dir")
+    parser.add_argument("output_csv", nargs="?", default=None)
+    args = parser.parse_args()
 
-    bag_path = sys.argv[1]
-    output_csv = sys.argv[2]
-    pose_topic = sys.argv[3] if len(sys.argv) > 3 else '/odom'
+    output_csv = args.output_csv or f"{_bag_name(args.bag_dir)}_path.csv"
 
-    reader = _open_reader(bag_path)
+    reader = _open_reader(args.bag_dir)
     type_map = {t.name: t.type for t in reader.get_all_topics_and_types()}
 
-    if pose_topic not in type_map:
-        nav_topics = [t for t in type_map if 'odom' in t or 'pose' in t or 'amcl' in t]
-        print(f"Warning: '{pose_topic}' not in bag. Pose-related topics found: {nav_topics}")
+    if args.pose_topic not in type_map:
+        pose_like = [t for t in type_map if 'odom' in t or 'pose' in t or 'amcl' in t]
+        print(f"Warning: '{args.pose_topic}' not in bag. Pose-related topics found: {pose_like}")
 
+    n = 0
     with open(output_csv, 'w', newline='') as f:
         writer = csv.writer(f)
         writer.writerow(['timestamp_s', 'x', 'y', 'yaw'])
 
         while reader.has_next():
             topic, data, ts_ns = reader.read_next()
-            if topic != pose_topic or topic not in type_map:
+            if topic != args.pose_topic or topic not in type_map:
                 continue
             msg = deserialize_message(data, get_message(type_map[topic]))
             x = msg.pose.pose.position.x
@@ -61,8 +62,9 @@ def main():
             q = msg.pose.pose.orientation
             _, _, yaw = euler_from_quaternion([q.x, q.y, q.z, q.w])
             writer.writerow([f'{ts_ns * 1e-9:.6f}', f'{x:.6f}', f'{y:.6f}', f'{yaw:.6f}'])
+            n += 1
 
-    print(f"Path saved to {output_csv}")
+    print(f"Path saved to {output_csv} ({n} poses)")
 
 
 if __name__ == '__main__':
