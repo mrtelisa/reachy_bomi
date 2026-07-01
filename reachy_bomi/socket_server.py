@@ -31,14 +31,14 @@ class ServerState:
 
 class ServerSocketNode(Node):
     def __init__(self) -> None:
-        super().__init__("server_socket_node")
+        super().__init__("socket_server_node")
         self.declare_parameter("port", PORT)
         self.port = self.get_parameter("port").get_parameter_value().integer_value
         self.state = ServerState()
 
-        self.linear_vel_pub = self.create_publisher(Float32, "server_socket/linear_vel", 10)
-        self.ang_vel_pub = self.create_publisher(Float32, "server_socket/angular_vel", 10)
-        self.base_state_pub = self.create_publisher(Float32, "server_socket/base_state", 10)
+        self.linear_vel_pub = self.create_publisher(Float32, "socket_server/linear_vel", 10)
+        self.ang_vel_pub = self.create_publisher(Float32, "socket_server/angular_vel", 10)
+        self.base_state_pub = self.create_publisher(Float32, "socket_server/base_state", 10)
 
         local_ip = get_local_ip()
         self.server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -53,6 +53,8 @@ class ServerSocketNode(Node):
         while rclpy.ok():
             conn, addr = self.server.accept()
             self.get_logger().info(f"New connection from {addr}")
+            # This is made to allow that different clients can connect to the server at the 
+            # same time, each one in a different thread
             thread = threading.Thread(target=self._handle_client, args=(conn,), daemon=True)
             thread.start()
 

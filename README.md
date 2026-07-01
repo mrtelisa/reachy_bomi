@@ -15,17 +15,17 @@ The system is **distributed across two machines**:
 ```
   OPERATOR PC                          ROBOT / SIMULATION PC
   ───────────                          ─────────────────────
-  webcam → MediaPipe                   server_socket (ROS 2 node)
+  webcam → MediaPipe                   socket_server (ROS 2 node)
         → PCA cursor                        ├─ receives socket messages
-        → 9-region velocity                 └─ publishes server_socket/* topics
+        → 9-region velocity                 └─ publishes socket_server/* topics
         → TCP socket  ───────────────▶  cmd_vel_publisher (ROS 2 node)
      (socket_client.py)                      └─ republishes to /cmd_vel
                                          Gazebo + Reachy (reachy_bringup)
 ```
 
 1. **`socket_client.py`** runs on the **operator PC** (not on the robot). It needs a webcam and the MediaPipe stack. It calibrates a PCA hand-to-cursor map, then continuously sends velocity strings such as `lin_vel:0.500 ang_vel:-0.300` over TCP.
-2. **`server_socket`** (ROS 2 node) runs on the **robot/simulation side**. It opens the TCP server, decodes the incoming messages, and publishes them on `server_socket/linear_vel`, `server_socket/angular_vel`, `server_socket/base_state`, etc.
-3. **`cmd_vel_publisher`** (ROS 2 node) subscribes to those topics and, while the base is in velocity mode (`base_state == 1.0`), publishes a `geometry_msgs/Twist` on `/cmd_vel`.
+2. **`socket_server.py`** (ROS 2 node) runs on the **robot/simulation side**. It opens the TCP server, decodes the incoming messages, and publishes them on `socket_server/linear_vel`, `socket_server/angular_vel`, `socket_server/base_state`, etc.
+3. **`cmd_vel_publisher.py`** (ROS 2 node) subscribes to those topics and, while the base is in velocity mode (`base_state == 1.0`), publishes a `geometry_msgs/Twist` on `/cmd_vel`.
 4. The launch file also starts the **Reachy simulation in Gazebo** (via `reachy_bringup`) with the world chosen by the selected scenario, and records a **ROS 2 bag** of the run.
 
 The **velocity computation does not depend on the scenario** — the scenario only selects which Gazebo world (obstacles) is loaded. See [Scenarios](#scenarios).
@@ -74,7 +74,7 @@ source install/setup.bash
 ros2 launch reachy_bomi bomi_control.launch.py scenario:=familiarization
 ```
 
-This starts the Gazebo simulation with the scenario's world, the `server_socket` and `cmd_vel_publisher` nodes, and a `ros2 bag` recording into `~/reachy_bomi_bags/`.
+This starts the Gazebo simulation with the scenario's world, the `socket_server` and `cmd_vel_publisher` nodes, and a `ros2 bag` recording into `~/reachy_bomi_bags/`.
 
 Launch arguments:
 
@@ -128,7 +128,7 @@ reachy_bomi/
 ├── reachy_bomi/                    # ROS 2 Python package
 │   ├── __init__.py
 │   ├── socket_client.py            # operator-side client (MediaPipe → socket)
-│   ├── server_socket.py            # ROS 2 node: socket → ROS topics
+│   ├── socket_server.py            # ROS 2 node: socket → ROS topics
 │   ├── cmd_vel_publisher.py        # ROS 2 node: ROS topics → /cmd_vel
 │   └── scenarios.py                # loads scenarios.yaml, resolves worlds
 ├── config/

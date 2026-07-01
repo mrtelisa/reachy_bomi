@@ -8,10 +8,10 @@ Dependencies:
 
 Usage:
     # First time: run calibration and save it to the calib file
-    python3 socket_client.py <robot_ip> --calibrate
+    python3 socket_client.py <server_ip> --calibrate
 
     # Next times (default): load the saved calibration, no calibration phase
-    python3 socket_client.py <robot_ip>
+    python3 socket_client.py <server_ip>
 
     Options:
         --calibrate            Run the calibration phase and save it. If omitted
@@ -43,7 +43,7 @@ import numpy as np
 from sklearn.decomposition import PCA
 from sklearn.preprocessing import StandardScaler
 
-# --- Virtual screen dimensions (must match server_socket expectations) ---
+# --- Virtual screen dimensions (must match socket_server expectations) ---
 BASE_WIDTH = 2550
 BASE_HEIGHT = 1500
 
@@ -338,7 +338,7 @@ def _control_phase(cap, hands, bomi_map: BoMIMap, robot: RobotSocket) -> None:
 # --- Entry point ---
 def main() -> None:
     parser = argparse.ArgumentParser(description="BoMI client for Reachy2")
-    parser.add_argument("robot_ip", help="IP address of the Reachy robot")
+    parser.add_argument("server_ip", help="IP address of the Reachy robot")
     parser.add_argument("--port", type=int, default=5051)
     parser.add_argument("--cam", type=int, default=0, help="Webcam index (default: 0)")
     parser.add_argument("--calibrate", action="store_true",
@@ -354,7 +354,7 @@ def main() -> None:
     if not args.calibrate and not os.path.exists(calib_path):
         print(f"[ERROR] No calibration file '{calib_path}' found.")
         print("        Run once with --calibrate to create it, e.g.:")
-        print(f"        python3 socket_client.py {args.robot_ip} --calibrate")
+        print(f"        python3 socket_client.py {args.server_ip} --calibrate")
         sys.exit(1)
 
     cap = cv2.VideoCapture(args.cam)
@@ -368,7 +368,7 @@ def main() -> None:
         min_detection_confidence=0.7,
     )
 
-    robot = RobotSocket(args.robot_ip, args.port)
+    robot = RobotSocket(args.server_ip, args.port)
     try:
         bomi_map = BoMIMap()
         if args.calibrate:

@@ -16,9 +16,9 @@ class CmdVelPublisher(Node):
 
         self.cmd_vel_pub = self.create_publisher(Twist, "/cmd_vel", 10)
 
-        self.create_subscription(Float32, "server_socket/base_state", self._base_state_cb, 10)
-        self.create_subscription(Float32, "server_socket/linear_vel", self._linear_vel_cb, 10)
-        self.create_subscription(Float32, "server_socket/angular_vel", self._ang_vel_cb, 10)
+        self.create_subscription(Float32, "socket_server/base_state", self._base_state_cb, 10)
+        self.create_subscription(Float32, "socket_server/linear_vel", self._linear_vel_cb, 10)
+        self.create_subscription(Float32, "socket_server/angular_vel", self._ang_vel_cb, 10)
 
         self.timer = self.create_timer(0.1, self._control_loop)
         self.get_logger().info("Reachy base controller started")

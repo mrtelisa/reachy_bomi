@@ -22,7 +22,7 @@ setup(
     license='TODO: License declaration',
     entry_points={
         'console_scripts': [
-            'server_socket = reachy_bomi.server_socket:main',
+            'socket_server = reachy_bomi.socket_server:main',
             'cmd_vel_publisher = reachy_bomi.cmd_vel_publisher:main',
         ],
     },
