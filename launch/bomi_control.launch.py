@@ -34,12 +34,6 @@ def launch_setup(context, *args, **kwargs):
         }.items(),
     )
 
-    socket_server_node = Node(
-        package="reachy_bomi",
-        executable="socket_server",
-        output="screen",
-    )
-
     cmd_vel_publisher_node = Node(
         package="reachy_bomi",
         executable="cmd_vel_publisher",
@@ -48,7 +42,6 @@ def launch_setup(context, *args, **kwargs):
 
     actions = [
         reachy_sim,
-        socket_server_node,
         cmd_vel_publisher_node,
     ]
 

@@ -15,18 +15,20 @@ The system is **distributed across two machines**:
 ```
   OPERATOR PC                          ROBOT / SIMULATION PC
   ───────────                          ─────────────────────
-  webcam → MediaPipe                   socket_server (ROS 2 node)
+  webcam → MediaPipe                   socket_server (always-on bridge node)
         → PCA cursor                        ├─ receives socket messages
-        → 9-region velocity                 └─ publishes socket_server/* topics
-        → TCP socket  ───────────────▶  cmd_vel_publisher (ROS 2 node)
-     (socket_client.py)                      └─ republishes to /cmd_vel
-                                         Gazebo + Reachy (reachy_bringup)
+        → 9-region velocity                 ├─ publishes socket_server/* topics
+        → TCP socket  ───────────────▶      └─ on "scenario:..." → launches
+     (socket_client.py)                          bomi_control.launch.py
+                                              ├─ Gazebo + Reachy (reachy_bringup)
+                                              ├─ cmd_vel_publisher → /cmd_vel
+                                              └─ ros2 bag record
 ```
 
-1. **`socket_client.py`** runs on the **operator PC** (not on the robot). It needs a webcam and the MediaPipe stack. It calibrates a PCA hand-to-cursor map, then continuously sends velocity strings such as `lin_vel:0.500 ang_vel:-0.300` over TCP.
-2. **`socket_server.py`** (ROS 2 node) runs on the **robot/simulation side**. It opens the TCP server, decodes the incoming messages, and publishes them on `socket_server/linear_vel`, `socket_server/angular_vel`, `socket_server/base_state`, etc.
-3. **`cmd_vel_publisher.py`** (ROS 2 node) subscribes to those topics and, while the base is in velocity mode (`base_state == 1.0`), publishes a `geometry_msgs/Twist` on `/cmd_vel`.
-4. The launch file also starts the **Reachy simulation in Gazebo** (via `reachy_bringup`) with the world chosen by the selected scenario, and records a **ROS 2 bag** of the run.
+1. **`socket_client.py`** runs on the **operator PC** (not on the robot). It needs a webcam and the MediaPipe stack. Optionally, it first sends a scenario request (`scenario:<name> rviz:<true|false> record:<true|false>`) and waits for the simulation to come up; it then calibrates a PCA hand-to-cursor map and continuously sends velocity strings such as `lin_vel:0.500 ang_vel:-0.300` over TCP.
+2. **`socket_server.py`** (ROS 2 node, started once via `bomi_bridge.launch.py` and left running) opens the TCP server and decodes incoming messages. Velocity/state messages are published on `socket_server/linear_vel`, `socket_server/angular_vel`, `socket_server/base_state`. A `scenario:...` message instead makes it run `ros2 launch reachy_bomi bomi_control.launch.py` itself (terminating any scenario it had previously launched).
+3. **`cmd_vel_publisher.py`** (ROS 2 node, started by `bomi_control.launch.py`) subscribes to those topics and, while the base is in velocity mode (`base_state == 1.0`), publishes a `geometry_msgs/Twist` on `/cmd_vel`.
+4. **`bomi_control.launch.py`** starts the **Reachy simulation in Gazebo** (via `reachy_bringup`) with the world chosen by the selected scenario, `cmd_vel_publisher`, and (optionally) records a **ROS 2 bag** of the run. It can also be launched manually on the robot PC instead of being triggered remotely — see [Usage](#usage).
 
 The **velocity computation does not depend on the scenario** — the scenario only selects which Gazebo world (obstacles) is loaded. See [Scenarios](#scenarios).
 
@@ -45,7 +47,7 @@ The **velocity computation does not depend on the scenario** — the scenario on
 **Operator PC (client, plain Python — no ROS required):**
 
 ```bash
-pip install mediapipe opencv-python scikit-learn numpy
+pip install mediapipe opencv-python scikit-learn numpy scipy
 ```
 
 Both machines must be on the **same network** and able to reach each other on the TCP port (default `5051`).
@@ -68,30 +70,45 @@ source install/setup.bash
 
 ## Usage
 
-### 1. On the robot / simulation PC — launch the simulation and the bridge nodes
+### 1. On the robot / simulation PC — start the bridge (once)
+
+```bash
+ros2 launch reachy_bomi bomi_bridge.launch.py
+```
+
+This starts only the `socket_server` node and leaves it running for the whole session. Note the **IP address** it prints in the log — that's what you pass to the client. You normally start this once and never touch it again; it launches/relaunches `bomi_control.launch.py` itself as scenario requests come in from the client (see step 2).
+
+If you'd rather launch a scenario manually on the robot PC without going through the socket (e.g. for local testing), you can still run `bomi_control.launch.py` directly instead of the bridge:
 
 ```bash
 ros2 launch reachy_bomi bomi_control.launch.py scenario:=familiarization
 ```
 
-This starts the Gazebo simulation with the scenario's world, the `socket_server` and `cmd_vel_publisher` nodes, and a `ros2 bag` recording into `~/reachy_bomi_bags/`.
-
 Launch arguments:
 
 | Argument     | Default           | Description                                              |
-|--------------|-------------------|---------------------------------------------------------|
-| `scenario`   | `familiarization` | Scenario to run (selects the Gazebo world). See below.  |
-| `start_rviz` | `true`            | Whether to start RViz (`true` / `false`).               |
-
-When the node starts, note the **IP address** the socket server is listening on (printed in the log).
+|--------------|-------------------|-----------------------------------------------------------|
+| `scenario`   | `familiarization` | Scenario to run (selects the Gazebo world). See below.       |
+| `start_rviz` | `true`            | Whether to start RViz (`true` / `false`).                    |
+| `record`     | `true`            | Whether to record a ROS 2 bag of the run (`true` / `false`). |
 
 ### 2. On the operator PC — run the hand-tracking client
 
 ```bash
-python3 socket_client.py <robot_ip> [--port 5051] [--cam 0]
+# First time (or to recalibrate): run the calibration phase and save it
+python3 socket_client.py <robot_ip> --calibrate [--calib bomi_calib.npz] [--port 5051] [--cam 0] \
+    [--scenario familiarization] [--start-rviz true] [--record true] [--sim-wait 25]
+
+# Next times: load the saved calibration, skip straight to control
+python3 socket_client.py <robot_ip> [--port 5051] [--cam 0] \
+    [--scenario familiarization] [--start-rviz true] [--record true] [--sim-wait 25]
 ```
 
-**Phase 1 — Calibration:** move your hand through all the positions you intend to use.
+`<robot_ip>` is optional if you've set `DEFAULT_HOST` in `socket_client.py` to your robot's IP; otherwise pass it explicitly. If `--scenario` is given, the client sends `scenario:<name> rviz:<start_rviz> record:<record>` to the bridge right after connecting, waits `--sim-wait` seconds for the simulation to come up, and only then starts calibration/control. If `--scenario` is omitted, no scenario request is sent (useful when a scenario is already running, e.g. launched manually per step 1).
+
+`--calibrate` is **opt-in**: without it, `socket_client.py` skips Phase 1 entirely and loads the saved calibration file (`--calib`, a bare filename is stored in the package's `calibrations/` folder; default `bomi_calib.npz`) — it fails immediately if that file doesn't exist yet. Pass `--calibrate` the first time, or whenever you want to redo it.
+
+**Phase 1 — Calibration** (only with `--calibrate`): move your hand through all the positions you intend to use.
 `SPACE` records a sample, `ENTER` finishes (minimum 30 samples), `Q` quits.
 
 **Phase 2 — Control:** your hand drives the cursor; the cursor position is mapped to base velocities and streamed to the robot. Press `Q` to stop the robot and quit.
@@ -134,7 +151,8 @@ reachy_bomi/
 ├── config/
 │   └── scenarios.yaml              # scenario definitions
 ├── launch/
-│   └── bomi_control.launch.py      # simulation + bridge nodes + bag recording
+│   ├── bomi_bridge.launch.py       # persistent socket_server bridge (start once)
+│   └── bomi_control.launch.py      # simulation + cmd_vel_publisher + bag recording
 ├── scripts/                        # offline analysis tools (not part of runtime)
 │   ├── extract_path.py
 │   ├── trajectory_map_collisions.py

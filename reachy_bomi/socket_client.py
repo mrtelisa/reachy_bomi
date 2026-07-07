@@ -25,7 +25,11 @@ Usage:
         --cam INDEX            Webcam index. Default: 0
         --scenario NAME        Scenario name to send to the robot right after connecting
                                (e.g. "familiarization"). If omitted, no scenario message
-                               is sent. Requires a robot-side handler for the given name.
+                               is sent and --start-rviz/--record/--sim-wait are ignored.
+        --start-rviz true|false  Whether the robot side should start RViz for this
+                               scenario. Default: true
+        --record true|false    Whether the robot side should record a ROS 2 bag for
+                               this scenario. Default: true
         --sim-wait SECONDS     Seconds to wait after sending the scenario, to give the
                                robot side time to bring up the simulation before the
                                control loop starts sending velocities. Default: 25.0
@@ -400,6 +404,12 @@ def main() -> None:
     parser.add_argument("--scenario", default=None,
                         help="Scenario name to send to the robot right after connecting "
                              "(e.g. 'familiarization'). Omit to skip sending a scenario.")
+    parser.add_argument("--start-rviz", choices=["true", "false"], default="true",
+                        help="Whether the robot side should start RViz for this scenario "
+                             "(default: true). Only used if --scenario is set.")
+    parser.add_argument("--record", choices=["true", "false"], default="true",
+                        help="Whether the robot side should record a ROS 2 bag for this "
+                             "scenario (default: true). Only used if --scenario is set.")
     parser.add_argument("--sim-wait", type=float, default=25.0,
                         help="Seconds to wait after sending the scenario before starting "
                              "the control loop, to let the robot side bring up the "
@@ -420,8 +430,9 @@ def main() -> None:
     hands = None
     try:
         if args.scenario:
-            print(f"[SCENARIO] Sending '{args.scenario}' to the robot")
-            robot.send(args.scenario)
+            scenario_msg = f"scenario:{args.scenario} rviz:{args.start_rviz} record:{args.record}"
+            print(f"[SCENARIO] Sending '{scenario_msg}' to the robot")
+            robot.send(scenario_msg)
             print(f"[SCENARIO] Waiting {args.sim_wait:.0f}s for the simulation to start...")
             time.sleep(args.sim_wait)
 
