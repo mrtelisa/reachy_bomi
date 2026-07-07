@@ -4,7 +4,7 @@ BoMI client for Reachy2 teleoperation.
 Runs on the operator PC, NOT on the robot.
 
 Dependencies:
-    pip install mediapipe opencv-python scikit-learn numpy
+    pip install mediapipe opencv-python scikit-learn numpy scipy
 
 Usage:
     # First time: run calibration and save it to the calib file
@@ -48,6 +48,7 @@ import time
 import cv2
 import mediapipe as mp
 import numpy as np
+import scipy.signal as sgn
 from sklearn.decomposition import PCA
 
 # --- Virtual screen dimensions (must match socket_server expectations) ---
@@ -58,6 +59,12 @@ MAX_LINEAR = 1.0      # m/s
 MAX_ANGULAR = 0.8     # rad/s
 DEAD_ZONE_PX = 200    # pixel radius around screen center before motion starts
 
+# Cursor low-pass filter: 3rd-order
+# Butterworth, coefficients derived from the actual control loop rate below
+# rather than hardcoded for 50Hz.
+CURSOR_FILTER_HZ = 30.0        # assumed webcam/control loop sample rate
+CURSOR_FILTER_CUTOFF_HZ = 4.0  # cutoff frequency
+
 FORMAT = "utf-8"
 DISCONNECT_MESSAGE = "!DISCONNECT"
 
@@ -65,7 +72,7 @@ DISCONNECT_MESSAGE = "!DISCONNECT"
 DEFAULT_HOST = "192.168.1.100"
 
 # Calibration files live in a 'calibrations/' folder next to this script
-# (i.e. inside the reachy_bomi package). A bare --calib filename is placed there;
+# (inside the reachy_bomi package). A bare --calib filename is placed there;
 # a --calib value that already contains a path is used as-is.
 CALIB_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "calibrations")
 DEFAULT_CALIB_FILE = "bomi_calib.npz"
@@ -158,9 +165,45 @@ def apply_region_velocity_mask(region: int, lin_vel: float, ang_vel: float) -> t
 
 
 # --- PCA forward map ---
-def _extract_hand_features(hand_landmarks) -> np.ndarray:
-    """Flatten all 21 hand landmarks (x, y) into a 42-element vector."""
-    return np.array([[lm.x, lm.y] for lm in hand_landmarks.landmark]).flatten()
+def _extract_hand_features(hand_landmarks, mirror_x: bool = False) -> np.ndarray:
+    """
+    Flatten all 21 hand landmarks (x, y) into a 42-element vector.
+    If mirror_x, x is mirrored (1 - x) so the right hand maps to the same
+    feature space as the left hand.
+    """
+    coords = [[1.0 - lm.x if mirror_x else lm.x, lm.y] for lm in hand_landmarks.landmark]
+    return np.array(coords).flatten()
+
+
+class CursorFilter:
+    """
+    3rd-order Butterworth low-pass filter for the (crs_x, crs_y) cursor position.
+    Coefficients are derived from the actual sample rate (CURSOR_FILTER_HZ) instead 
+    of being hardcoded for a fixed frequency loop.
+    """
+
+    ORDER = 3
+
+    def __init__(self, sample_hz: float = CURSOR_FILTER_HZ, cutoff_hz: float = CURSOR_FILTER_CUTOFF_HZ) -> None:
+        nyquist = sample_hz / 2.0
+        self._b, self._a = sgn.butter(self.ORDER, cutoff_hz / nyquist, btype="low")
+        self._in_history = np.zeros((self.ORDER, 2))
+        self._out_history = np.zeros((self.ORDER, 2))
+
+    def update(self, crs_x: float, crs_y: float) -> tuple:
+        new_input = np.array([crs_x, crs_y])
+        new_output = self._b[0] * new_input
+        for i in range(self.ORDER):
+            new_output += self._b[i + 1] * self._in_history[i]
+        for i in range(self.ORDER):
+            new_output -= self._a[i + 1] * self._out_history[i]
+
+        self._in_history = np.roll(self._in_history, 1, axis=0)
+        self._in_history[0] = new_input
+        self._out_history = np.roll(self._out_history, 1, axis=0)
+        self._out_history[0] = new_output
+
+        return float(new_output[0]), float(new_output[1])
 
 
 class BoMIMap:
@@ -274,7 +317,8 @@ def _calibration_phase(cap, hands) -> list:
         key = cv2.waitKey(1) & 0xFF
 
         if key == ord(' ') and results.multi_hand_landmarks:
-            samples.append(_extract_hand_features(results.multi_hand_landmarks[0]))
+            mirror_x = results.multi_handedness[0].classification[0].label == "Right"
+            samples.append(_extract_hand_features(results.multi_hand_landmarks[0], mirror_x))
             print(f"  Sample {len(samples)} recorded")
 
         elif key == 13:  # ENTER
@@ -296,6 +340,7 @@ def _control_phase(cap, hands, bomi_map: BoMIMap, robot: RobotSocket) -> None:
     SEND_HZ = 20
     dt = 1.0 / SEND_HZ
     last_send = time.time()
+    cursor_filter = CursorFilter()
 
     print("\n=== CONTROL ===  Q = quit")
     robot.send("nine region")
@@ -314,7 +359,9 @@ def _control_phase(cap, hands, bomi_map: BoMIMap, robot: RobotSocket) -> None:
             mp.solutions.drawing_utils.draw_landmarks(
                 frame, hl, mp.solutions.hands.HAND_CONNECTIONS
             )
-            crs_x, crs_y = bomi_map.transform(_extract_hand_features(hl))
+            mirror_x = results.multi_handedness[0].classification[0].label == "Right"
+            crs_x, crs_y = bomi_map.transform(_extract_hand_features(hl, mirror_x))
+            crs_x, crs_y = cursor_filter.update(crs_x, crs_y)
             region = check_region_cursor(crs_x, crs_y)
             lin_vel, ang_vel = compute_dynamic_vel_from_cursor(crs_x, crs_y)
             lin_vel, ang_vel = apply_region_velocity_mask(region, lin_vel, ang_vel)
