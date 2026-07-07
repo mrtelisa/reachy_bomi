@@ -13,6 +13,8 @@ Usage:
     # Next times (default): load the saved calibration, no calibration phase
     python3 socket_client.py <server_ip>
 
+    <server_ip> is optional; if omitted, HOST (set in this file) is used.
+
     Options:
         --calibrate            Run the calibration phase and save it. If omitted
                                (default), the saved calibration is loaded instead.
@@ -21,6 +23,12 @@ Usage:
                                Default: bomi_calib.npz
         --port PORT            Robot socket port. Default: 5051
         --cam INDEX            Webcam index. Default: 0
+        --scenario NAME        Scenario name to send to the robot right after connecting
+                               (e.g. "familiarization"). If omitted, no scenario message
+                               is sent. Requires a robot-side handler for the given name.
+        --sim-wait SECONDS     Seconds to wait after sending the scenario, to give the
+                               robot side time to bring up the simulation before the
+                               control loop starts sending velocities. Default: 25.0
 
 Phase 1 - Calibration (only with --calibrate):
     Move your hand through all positions you intend to use.
@@ -41,7 +49,6 @@ import cv2
 import mediapipe as mp
 import numpy as np
 from sklearn.decomposition import PCA
-from sklearn.preprocessing import StandardScaler
 
 # --- Virtual screen dimensions (must match socket_server expectations) ---
 BASE_WIDTH = 2550
@@ -53,6 +60,9 @@ DEAD_ZONE_PX = 200    # pixel radius around screen center before motion starts
 
 FORMAT = "utf-8"
 DISCONNECT_MESSAGE = "!DISCONNECT"
+
+# Placeholder — replace with Reachy's actual IP on your network.
+DEFAULT_HOST = "192.168.1.100"
 
 # Calibration files live in a 'calibrations/' folder next to this script
 # (i.e. inside the reachy_bomi package). A bare --calib filename is placed there;
@@ -157,47 +167,42 @@ class BoMIMap:
     """
     PCA forward map: raw hand landmarks -> 2D cursor in screen space.
 
-    Calibration fits StandardScaler + PCA(2 components) on collected samples,
-    then computes a linear scale/offset so the PCA output spans the full screen.
+    PCA(2 components) fitted directly on the raw landmark samples. Scale/offset 
+    map the calibration scores' peak-to-peak range onto the screen size, centered 
+    on the mean.
 
-    The fitted parameters (scaler mean/std, PCA components, scale, offset) are
-    plain numpy arrays, so the map can be saved to / loaded from a .npz file and
-    reused without repeating calibration.
+    The fitted parameters (PCA mean, components, scale, offset) are plain numpy
+    arrays, so the map can be saved to / loaded from a .npz file and reused
+    without repeating calibration.
     """
 
     def __init__(self) -> None:
-        self._mean = None         # scaler mean (42,)
-        self._std = None          # scaler std  (42,)
+        self._mean = None         # PCA mean (42,)
         self._components = None   # PCA components (2, 42)
         self._scale = np.ones(2)
         self._offset = np.zeros(2)
         self.fitted = False
 
-    def fit(self, samples: list, margin: float = 100.0) -> None:
+    def fit(self, samples: list) -> None:
         X = np.array(samples)
 
-        scaler = StandardScaler()
-        X_scaled = scaler.fit_transform(X)
         pca = PCA(n_components=2)
-        scores = pca.fit_transform(X_scaled)
+        scores = pca.fit_transform(X)
 
-        min_s = scores.min(axis=0)
-        max_s = scores.max(axis=0)
-        extent = np.where(max_s - min_s > 1e-6, max_s - min_s, 1.0)
+        extent = np.ptp(scores, axis=0)
+        extent = np.where(extent > 1e-6, extent, 1.0)
 
         screen = np.array([BASE_WIDTH, BASE_HEIGHT], dtype=float)
 
-        # Store the plain arrays needed for inference (decoupled from sklearn objects)
-        self._mean = scaler.mean_
-        self._std = scaler.scale_
+        # Store the plain arrays needed for inference (decoupled from the sklearn object)
+        self._mean = pca.mean_
         self._components = pca.components_
-        self._scale = (screen - 2 * margin) / extent
-        self._offset = margin - min_s * self._scale
+        self._scale = screen / extent
+        self._offset = screen / 2.0 - (scores * self._scale).mean(axis=0)
         self.fitted = True
 
     def transform(self, features: np.ndarray) -> tuple:
-        body = (features - self._mean) / self._std
-        cu = np.dot(body, self._components.T)
+        cu = np.dot(features - self._mean, self._components.T)
         cu = cu * self._scale + self._offset
         crs_x = float(np.clip(cu[0], 0, BASE_WIDTH))
         crs_y = float(np.clip(cu[1], 0, BASE_HEIGHT))
@@ -209,7 +214,6 @@ class BoMIMap:
         np.savez(
             path,
             mean=self._mean,
-            std=self._std,
             components=self._components,
             scale=self._scale,
             offset=self._offset,
@@ -218,7 +222,6 @@ class BoMIMap:
     def load(self, path: str) -> None:
         data = np.load(path)
         self._mean = data["mean"]
-        self._std = data["std"]
         self._components = data["components"]
         self._scale = data["scale"]
         self._offset = data["offset"]
@@ -338,7 +341,8 @@ def _control_phase(cap, hands, bomi_map: BoMIMap, robot: RobotSocket) -> None:
 # --- Entry point ---
 def main() -> None:
     parser = argparse.ArgumentParser(description="BoMI client for Reachy2")
-    parser.add_argument("server_ip", help="IP address of the Reachy robot")
+    parser.add_argument("server_ip", nargs="?", default=DEFAULT_HOST,
+                        help=f"IP address of the Reachy robot (default: {DEFAULT_HOST})")
     parser.add_argument("--port", type=int, default=5051)
     parser.add_argument("--cam", type=int, default=0, help="Webcam index (default: 0)")
     parser.add_argument("--calibrate", action="store_true",
@@ -346,6 +350,13 @@ def main() -> None:
     parser.add_argument("--calib", default=DEFAULT_CALIB_FILE,
                         help="Calibration file. A bare filename is stored in the "
                              f"calibrations/ folder inside the package (default: {DEFAULT_CALIB_FILE}).")
+    parser.add_argument("--scenario", default=None,
+                        help="Scenario name to send to the robot right after connecting "
+                             "(e.g. 'familiarization'). Omit to skip sending a scenario.")
+    parser.add_argument("--sim-wait", type=float, default=25.0,
+                        help="Seconds to wait after sending the scenario before starting "
+                             "the control loop, to let the robot side bring up the "
+                             "simulation (default: 25.0).")
     args = parser.parse_args()
 
     calib_path = _resolve_calib_path(args.calib)
@@ -357,19 +368,27 @@ def main() -> None:
         print(f"        python3 socket_client.py {args.server_ip} --calibrate")
         sys.exit(1)
 
-    cap = cv2.VideoCapture(args.cam)
-    if not cap.isOpened():
-        print(f"[ERROR] Cannot open camera {args.cam}")
-        sys.exit(1)
-
-    hands = mp.solutions.hands.Hands(
-        static_image_mode=False,
-        max_num_hands=1,
-        min_detection_confidence=0.7,
-    )
-
     robot = RobotSocket(args.server_ip, args.port)
+    cap = None
+    hands = None
     try:
+        if args.scenario:
+            print(f"[SCENARIO] Sending '{args.scenario}' to the robot")
+            robot.send(args.scenario)
+            print(f"[SCENARIO] Waiting {args.sim_wait:.0f}s for the simulation to start...")
+            time.sleep(args.sim_wait)
+
+        cap = cv2.VideoCapture(args.cam)
+        if not cap.isOpened():
+            print(f"[ERROR] Cannot open camera {args.cam}")
+            sys.exit(1)
+
+        hands = mp.solutions.hands.Hands(
+            static_image_mode=False,
+            max_num_hands=1,
+            min_detection_confidence=0.7,
+        )
+
         bomi_map = BoMIMap()
         if args.calibrate:
             samples = _calibration_phase(cap, hands)
@@ -384,9 +403,11 @@ def main() -> None:
         _control_phase(cap, hands, bomi_map, robot)
     finally:
         robot.close()
-        cap.release()
+        if cap is not None:
+            cap.release()
         cv2.destroyAllWindows()
-        hands.close()
+        if hands is not None:
+            hands.close()
 
 
 if __name__ == "__main__":
