@@ -1,66 +1,50 @@
 #!/usr/bin/env python3
 """
-BoMI client for Reachy2 teleoperation.
-Runs on the operator PC, NOT on the robot.
+BoMI teleop node for Reachy2: hand tracking directly to /cmd_vel.
+
+Runs entirely on the robot PC (or any single PC with a webcam and access to
+the ROS 2 network) — mediapipe/opencv computation and the ROS 2 publisher
+live in the same process, no socket between two machines.
 
 Dependencies:
     pip install mediapipe opencv-python scikit-learn numpy scipy
 
 Usage:
-    # First time: run calibration and save it to the calib file
-    python3 socket_client.py <server_ip> --calibrate
-
-    # Next times (default): load the saved calibration, no calibration phase
-    python3 socket_client.py <server_ip>
-
-    <server_ip> is optional; if omitted, HOST (set in this file) is used.
+    # Every run starts with calibration, then goes straight into control.
+    ros2 run reachy_bomi bomi_teleop
 
     Options:
-        --calibrate            Run the calibration phase and save it. If omitted
-                               (default), the saved calibration is loaded instead.
-        --calib PATH           Calibration file. A bare filename is saved in the
-                               calibrations/ folder inside the package.
-                               Default: bomi_calib.npz
         --model PATH           Path to the MediaPipe hand_landmarker.task model.
-                               Default: scripts/hand_landmarker.task inside the package.
-        --port PORT            Robot socket port. Default: 5051
+                               Default: hand_landmarker.task inside the package.
         --cam INDEX            Webcam index. Default: 0
-        --scenario NAME        Scenario name to send to the robot right after connecting
-                               (e.g. "familiarization"). If omitted, no scenario message
-                               is sent and --start-rviz/--record/--sim-wait are ignored.
-        --start-rviz true|false  Whether the robot side should start RViz for this
-                               scenario. Default: true
-        --record true|false    Whether the robot side should record a ROS 2 bag for
-                               this scenario. Default: true
-        --sim-wait SECONDS     Seconds to wait after sending the scenario, to give the
-                               robot side time to bring up the simulation before the
-                               control loop starts sending velocities. Default: 25.0
 
-Phase 1 - Calibration (only with --calibrate):
+Phase 1 - Calibration (always runs first):
     Move your hand through all positions you intend to use.
     SPACE = record sample   |   ENTER = finish (min 30 samples required)
 
 Phase 2 - Control:
-    Hand movement -> PCA cursor -> 9-region velocity -> TCP socket to robot.
+    Hand movement -> PCA cursor -> 9-region velocity -> /cmd_vel.
     Opens two windows: the webcam feed with landmarks, and a map of the
     virtual screen with the 9-region grid lines and a dot at the current
     cursor position.
-    Q, ESC, or closing a window with the X = quit and stop robot.
+    Q, ESC, or closing a window with the X = quit and stop the robot.
 """
 
 import argparse
 import os
-import socket
 import sys
 import time
 
 import cv2
 import mediapipe as mp
 import numpy as np
+import rclpy
 import scipy.signal as sgn
+from geometry_msgs.msg import Twist
 from mediapipe.tasks.python.core import base_options
 from mediapipe.tasks.python.vision import hand_landmarker
 from mediapipe.tasks.python.vision.core import vision_task_running_mode
+from rclpy.node import Node
 from sklearn.decomposition import PCA
 
 HAND_CONNECTIONS = hand_landmarker.HandLandmarksConnections.HAND_CONNECTIONS
@@ -73,7 +57,7 @@ MAX_LINEAR = 1.0      # m/s
 MAX_ANGULAR = 0.8     # rad/s
 DEAD_ZONE_PX = 200    # pixel radius around screen center before motion starts
 
-SEND_HZ = 20 # frequency of sending lin/ang velocities to the second computer (Hz)
+PUBLISH_HZ = 20  # /cmd_vel publish rate (Hz) — comfortably under zuuu_hal's 0.2s cmd_vel_timeout
 
 # Cursor low-pass filter: 3rd-order
 # Butterworth, coefficients derived from the actual control loop rate below
@@ -81,30 +65,10 @@ SEND_HZ = 20 # frequency of sending lin/ang velocities to the second computer (H
 CURSOR_FILTER_HZ = 30.0        # assumed webcam/control loop sample rate
 CURSOR_FILTER_CUTOFF_HZ = 4.0  # cutoff frequency
 
-FORMAT = "utf-8"
-DISCONNECT_MESSAGE = "!DISCONNECT"
-
-# Placeholder — replace with the second computer's IP
-DEFAULT_HOST = "192.168.1.100"
-
-# Calibration files live in a 'calibrations/' folder next to this script
-# (inside the reachy_bomi package). A bare --calib filename is placed there;
-# a --calib value that already contains a path is used as-is.
-CALIB_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "calibrations")
-DEFAULT_CALIB_FILE = "bomi_calib.npz"
-
-# MediaPipe Tasks hand-landmarker model (.task), lives in the 'scripts/' folder
-# next to this package by default.
+# MediaPipe Tasks hand-landmarker model (.task), lives at the package root by default.
 DEFAULT_MODEL_PATH = os.path.join(
-    os.path.dirname(os.path.abspath(__file__)), "..", "scripts", "hand_landmarker.task"
+    os.path.dirname(os.path.abspath(__file__)), "..", "hand_landmarker.task"
 )
-
-
-def _resolve_calib_path(calib_arg: str) -> str:
-    """Bare filename -> calibrations/ folder; explicit path -> used as given."""
-    if os.path.dirname(calib_arg):
-        return calib_arg
-    return os.path.join(CALIB_DIR, calib_arg)
 
 
 # --- Velocity helpers (adapted from reaching_functions.py) ---------
@@ -231,7 +195,7 @@ def _draw_cursor_map(crs_x: float, crs_y: float, region: int, message: str,
                       map_width: int = 850, map_height: int = 500):
     """Rectangle representing the BASE_WIDTH x BASE_HEIGHT virtual screen, with
     the 9-region grid lines, a dot at the current cursor position, and the
-    lin_vel/ang_vel message currently being sent to the robot."""
+    lin_vel/ang_vel message currently being published to /cmd_vel."""
     canvas = np.full((map_height, map_width, 3), 30, dtype=np.uint8)
     sx = map_width / BASE_WIDTH
     sy = map_height / BASE_HEIGHT
@@ -248,7 +212,7 @@ def _draw_cursor_map(crs_x: float, crs_y: float, region: int, message: str,
 
     cv2.putText(canvas, f"region={region}  cursor=({crs_x:.0f},{crs_y:.0f})",
                 (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
-    cv2.putText(canvas, f"-> PC2: {message}",
+    cv2.putText(canvas, f"-> /cmd_vel: {message}",
                 (10, 50), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
     return canvas
 
@@ -256,7 +220,7 @@ def _draw_cursor_map(crs_x: float, crs_y: float, region: int, message: str,
 class CursorFilter:
     """
     3rd-order Butterworth low-pass filter for the (crs_x, crs_y) cursor position.
-    Coefficients are derived from the actual sample rate (CURSOR_FILTER_HZ) instead 
+    Coefficients are derived from the actual sample rate (CURSOR_FILTER_HZ) instead
     of being hardcoded for a fixed frequency loop.
     """
 
@@ -288,13 +252,9 @@ class BoMIMap:
     """
     PCA forward map: raw hand landmarks -> 2D cursor in screen space.
 
-    PCA(2 components) fitted directly on the raw landmark samples. Scale/offset 
-    map the calibration scores' peak-to-peak range onto the screen size, centered 
+    PCA(2 components) fitted directly on the raw landmark samples. Scale/offset
+    map the calibration scores' peak-to-peak range onto the screen size, centered
     on the mean.
-
-    The fitted parameters (PCA mean, components, scale, offset) are plain numpy
-    arrays, so the map can be saved to / loaded from a .npz file and reused
-    without repeating calibration.
     """
 
     def __init__(self) -> None:
@@ -328,45 +288,6 @@ class BoMIMap:
         crs_x = float(np.clip(cu[0], 0, BASE_WIDTH))
         crs_y = float(np.clip(cu[1], 0, BASE_HEIGHT))
         return crs_x, crs_y
-
-    def save(self, path: str) -> None:
-        if not self.fitted:
-            raise RuntimeError("Cannot save an unfitted BoMIMap.")
-        np.savez(
-            path,
-            mean=self._mean,
-            components=self._components,
-            scale=self._scale,
-            offset=self._offset,
-        )
-
-    def load(self, path: str) -> None:
-        data = np.load(path)
-        self._mean = data["mean"]
-        self._components = data["components"]
-        self._scale = data["scale"]
-        self._offset = data["offset"]
-        self.fitted = True
-
-
-# --- Socket ---
-class RobotSocket:
-    def __init__(self, host: str, port: int) -> None:
-        self._sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        self._sock.connect((host, port))
-        print(f"[SOCKET] Connected to {host}:{port}")
-
-    def send(self, msg: str) -> None:
-        # '\n' delimiter so socket_server.py can tell separate messages apart
-        # even if TCP coalesces/splits them across recv() calls.
-        self._sock.sendall((msg + "\n").encode(FORMAT))
-
-    def close(self) -> None:
-        try:
-            self.send(DISCONNECT_MESSAGE)
-        except OSError:
-            pass
-        self._sock.close()
 
 
 # --- Phases ---
@@ -416,9 +337,9 @@ def _calibration_phase(cap, landmarker) -> list:
     return samples
 
 
-def _control_phase(cap, landmarker, bomi_map: BoMIMap, robot: RobotSocket) -> None:
-    dt = 1.0 / SEND_HZ
-    last_send = time.time()
+def _control_phase(cap, landmarker, bomi_map: BoMIMap, cmd_vel_pub) -> None:
+    dt = 1.0 / PUBLISH_HZ
+    last_publish = time.time()
     cursor_filter = CursorFilter()
     cam_window = "BoMI - Control"
     map_window = "BoMI - Cursor Map"
@@ -429,7 +350,6 @@ def _control_phase(cap, landmarker, bomi_map: BoMIMap, robot: RobotSocket) -> No
     message = "lin_vel:0.000 ang_vel:0.000"
 
     print("\n=== CONTROL ===  Q = quit")
-    robot.send("nine region")
 
     while True:
         ret, frame = cap.read()
@@ -457,15 +377,18 @@ def _control_phase(cap, landmarker, bomi_map: BoMIMap, robot: RobotSocket) -> No
                 (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2,
             )
             cv2.putText(
-                frame, f"-> PC2: {message}",
+                frame, f"-> /cmd_vel: {message}",
                 (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2,
             )
 
         now = time.time()
-        if now - last_send >= dt:
+        if now - last_publish >= dt:
             message = f"lin_vel:{lin_vel:.3f} ang_vel:{ang_vel:.3f}"
-            robot.send(message)
-            last_send = now
+            twist = Twist()
+            twist.linear.x = lin_vel
+            twist.angular.z = ang_vel
+            cmd_vel_pub.publish(twist)
+            last_publish = now
 
         cv2.imshow(cam_window, frame)
         cv2.imshow(map_window, _draw_cursor_map(crs_x, crs_y, region, message))
@@ -474,74 +397,41 @@ def _control_phase(cap, landmarker, bomi_map: BoMIMap, robot: RobotSocket) -> No
         if _quit_requested(key, cam_window) or _quit_requested(key, map_window):
             break
 
-    robot.send("lin_vel:0.000 ang_vel:0.000")
+    cmd_vel_pub.publish(Twist())
     cv2.destroyWindow(cam_window)
     cv2.destroyWindow(map_window)
 
 
 # --- Entry point ---
-def main() -> None:
-    parser = argparse.ArgumentParser(description="BoMI client for Reachy2")
-    parser.add_argument("server_ip", nargs="?", default=DEFAULT_HOST,
-                        help=f"IP address of the Reachy robot (default: {DEFAULT_HOST})")
-    parser.add_argument("--port", type=int, default=5051)
+def main(args=None) -> None:
+    rclpy.init(args=args)
+
+    parser = argparse.ArgumentParser(description="BoMI teleop for Reachy2")
     parser.add_argument("--cam", type=int, default=0, help="Webcam index (default: 0)")
-    parser.add_argument("--calibrate", action="store_true",
-                        help="Run calibration and save it. Default: load saved calibration.")
-    parser.add_argument("--calib", default=DEFAULT_CALIB_FILE,
-                        help="Calibration file. A bare filename is stored in the "
-                             f"calibrations/ folder inside the package (default: {DEFAULT_CALIB_FILE}).")
     parser.add_argument("--model", default=DEFAULT_MODEL_PATH,
                         help="Path to the MediaPipe hand_landmarker.task model "
                              f"(default: {DEFAULT_MODEL_PATH}).")
-    parser.add_argument("--scenario", default=None,
-                        help="Scenario name to send to the robot right after connecting "
-                             "(e.g. 'familiarization'). Omit to skip sending a scenario.")
-    parser.add_argument("--start-rviz", choices=["true", "false"], default="true",
-                        help="Whether the robot side should start RViz for this scenario "
-                             "(default: true). Only used if --scenario is set.")
-    parser.add_argument("--record", choices=["true", "false"], default="true",
-                        help="Whether the robot side should record a ROS 2 bag for this "
-                             "scenario (default: true). Only used if --scenario is set.")
-    parser.add_argument("--sim-wait", type=float, default=25.0,
-                        help="Seconds to wait after sending the scenario before starting "
-                             "the control loop, to let the robot side bring up the "
-                             "simulation (default: 25.0).")
-    args = parser.parse_args()
-
-    calib_path = _resolve_calib_path(args.calib)
-
-    # Fail early if we are supposed to load but there is no calibration file
-    if not args.calibrate and not os.path.exists(calib_path):
-        print(f"[ERROR] No calibration file '{calib_path}' found.")
-        print("        Run once with --calibrate to create it, e.g.:")
-        print(f"        python3 socket_client.py {args.server_ip} --calibrate")
-        sys.exit(1)
+    cli_args = parser.parse_args(args=rclpy.utilities.remove_ros_args(args=sys.argv)[1:])
 
     # Fail early if the hand-landmarker model is missing
-    if not os.path.exists(args.model):
-        print(f"[ERROR] MediaPipe model not found: '{args.model}'")
+    if not os.path.exists(cli_args.model):
+        print(f"[ERROR] MediaPipe model not found: '{cli_args.model}'")
         print("        Download hand_landmarker.task and pass its path with --model.")
         sys.exit(1)
 
-    robot = RobotSocket(args.server_ip, args.port)
+    node = Node("bomi_teleop")
+    cmd_vel_pub = node.create_publisher(Twist, "/cmd_vel", 10)
+
     cap = None
     landmarker = None
     try:
-        if args.scenario:
-            scenario_msg = f"scenario:{args.scenario} rviz:{args.start_rviz} record:{args.record}"
-            print(f"[SCENARIO] Sending '{scenario_msg}' to the robot")
-            robot.send(scenario_msg)
-            print(f"[SCENARIO] Waiting {args.sim_wait:.0f}s for the simulation to start...")
-            time.sleep(args.sim_wait)
-
-        cap = cv2.VideoCapture(args.cam)
+        cap = cv2.VideoCapture(cli_args.cam)
         if not cap.isOpened():
-            print(f"[ERROR] Cannot open camera {args.cam}")
+            print(f"[ERROR] Cannot open camera {cli_args.cam}")
             sys.exit(1)
 
         landmarker_options = hand_landmarker.HandLandmarkerOptions(
-            base_options=base_options.BaseOptions(model_asset_path=args.model),
+            base_options=base_options.BaseOptions(model_asset_path=cli_args.model),
             running_mode=vision_task_running_mode.VisionTaskRunningMode.VIDEO,
             num_hands=1,
             min_hand_detection_confidence=0.7,
@@ -551,24 +441,20 @@ def main() -> None:
         landmarker = hand_landmarker.HandLandmarker.create_from_options(landmarker_options)
 
         bomi_map = BoMIMap()
-        if args.calibrate:
-            samples = _calibration_phase(cap, landmarker)
-            bomi_map.fit(samples)
-            os.makedirs(os.path.dirname(calib_path) or ".", exist_ok=True)
-            bomi_map.save(calib_path)
-            print(f"PCA map fitted and saved to {calib_path}")
-        else:
-            bomi_map.load(calib_path)
-            print(f"Loaded calibration from {calib_path} (no calibration phase)")
+        samples = _calibration_phase(cap, landmarker)
+        bomi_map.fit(samples)
+        print("PCA map fitted")
 
-        _control_phase(cap, landmarker, bomi_map, robot)
+        _control_phase(cap, landmarker, bomi_map, cmd_vel_pub)
     finally:
-        robot.close()
+        cmd_vel_pub.publish(Twist())
         if cap is not None:
             cap.release()
         cv2.destroyAllWindows()
         if landmarker is not None:
             landmarker.close()
+        node.destroy_node()
+        rclpy.shutdown()
 
 
 if __name__ == "__main__":
