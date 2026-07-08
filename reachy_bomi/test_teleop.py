@@ -1,21 +1,17 @@
 #!/usr/bin/env python3
 """
-BoMI teleop for Reachy2: hand tracking directly to the mobile base, over
-reachy2_sdk (gRPC/IP) — no ROS 2 required on this machine, so its ROS 2
-distro (if any) doesn't need to match the robot's.
-
-Runs entirely on a single PC with a webcam and network access to the robot;
-mediapipe/opencv computation and the reachy2_sdk client live in the same
-process.
+Test/dry-run version of bomi_teleop.py: same hand-tracking -> velocity
+pipeline, but instead of sending anything to the robot, it just logs the
+lin_vel/ang_vel that *would* be sent. No reachy2_sdk connection, no robot
+required — use this to sanity-check the computed velocities before running
+the real bomi_teleop.py against the robot.
 
 Dependencies:
-    pip install reachy2-sdk mediapipe opencv-python scikit-learn numpy scipy
+    pip install mediapipe opencv-python scikit-learn numpy scipy
 
 Usage:
     # Every run starts with calibration, then goes straight into control.
-    python3 bomi_teleop.py [robot_ip]
-
-    <robot_ip> is optional; if omitted, DEFAULT_ROBOT_IP (set in this file) is used.
+    python3 test_teleop.py
 
     Options:
         --model PATH           Path to the MediaPipe hand_landmarker.task model.
@@ -27,11 +23,11 @@ Phase 1 - Calibration (always runs first):
     SPACE = record sample   |   ENTER = finish (min 30 samples required)
 
 Phase 2 - Control:
-    Hand movement -> PCA cursor -> 9-region velocity -> mobile base.
+    Hand movement -> PCA cursor -> 9-region velocity -> logged, not sent.
     Opens two windows: the webcam feed with landmarks, and a map of the
     virtual screen with the 9-region grid lines and a dot at the current
     cursor position.
-    Q, ESC, or closing a window with the X = quit and stop the robot.
+    Q, ESC, or closing a window with the X = quit.
 """
 
 import argparse
@@ -47,7 +43,6 @@ import scipy.signal as sgn
 from mediapipe.tasks.python.core import base_options
 from mediapipe.tasks.python.vision import hand_landmarker
 from mediapipe.tasks.python.vision.core import vision_task_running_mode
-from reachy2_sdk import ReachySDK
 from sklearn.decomposition import PCA
 
 HAND_CONNECTIONS = hand_landmarker.HandLandmarksConnections.HAND_CONNECTIONS
@@ -72,9 +67,6 @@ CURSOR_FILTER_CUTOFF_HZ = 4.0  # cutoff frequency
 DEFAULT_MODEL_PATH = os.path.join(
     os.path.dirname(os.path.abspath(__file__)), "..", "hand_landmarker.task"
 )
-
-# Placeholder — replace with the robot's actual IP.
-DEFAULT_ROBOT_IP = "192.168.1.100"
 
 
 # --- Velocity helpers (adapted from reaching_functions.py) ---------
@@ -201,7 +193,7 @@ def _draw_cursor_map(crs_x: float, crs_y: float, region: int, message: str,
                       map_width: int = 850, map_height: int = 500):
     """Rectangle representing the BASE_WIDTH x BASE_HEIGHT virtual screen, with
     the 9-region grid lines, a dot at the current cursor position, and the
-    lin_vel/ang_vel message currently being sent to the mobile base."""
+    lin_vel/ang_vel message that would be sent to the mobile base."""
     canvas = np.full((map_height, map_width, 3), 30, dtype=np.uint8)
     sx = map_width / BASE_WIDTH
     sy = map_height / BASE_HEIGHT
@@ -218,7 +210,7 @@ def _draw_cursor_map(crs_x: float, crs_y: float, region: int, message: str,
 
     cv2.putText(canvas, f"region={region}  cursor=({crs_x:.0f},{crs_y:.0f})",
                 (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
-    cv2.putText(canvas, f"-> mobile base: {message}",
+    cv2.putText(canvas, f"-> (test) would send: {message}",
                 (10, 50), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
     return canvas
 
@@ -343,19 +335,19 @@ def _calibration_phase(cap, landmarker) -> list:
     return samples
 
 
-def _control_phase(cap, landmarker, bomi_map: BoMIMap, mobile_base) -> None:
+def _control_phase(cap, landmarker, bomi_map: BoMIMap) -> None:
     dt = 1.0 / PUBLISH_HZ
     last_publish = time.time()
     cursor_filter = CursorFilter()
-    cam_window = "BoMI - Control"
-    map_window = "BoMI - Cursor Map"
+    cam_window = "BoMI - Control (TEST)"
+    map_window = "BoMI - Cursor Map (TEST)"
 
     # Start centered (region 5) until the first hand detection updates it.
     crs_x, crs_y = BASE_WIDTH / 2.0, BASE_HEIGHT / 2.0
     region = check_region_cursor(crs_x, crs_y)
     message = "lin_vel:0.000 ang_vel:0.000"
 
-    print("\n=== CONTROL ===  Q = quit")
+    print("\n=== CONTROL (TEST — nothing is sent to the robot) ===  Q = quit")
 
     while True:
         ret, frame = cap.read()
@@ -383,16 +375,16 @@ def _control_phase(cap, landmarker, bomi_map: BoMIMap, mobile_base) -> None:
                 (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2,
             )
             cv2.putText(
-                frame, f"-> mobile base: {message}",
+                frame, f"-> (test) would send: {message}",
                 (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2,
             )
 
         now = time.time()
         if now - last_publish >= dt:
             message = f"lin_vel:{lin_vel:.3f} ang_vel:{ang_vel:.3f}"
-            # vtheta is in degrees/s for reachy2_sdk, ang_vel is computed in rad/s
-            mobile_base.set_goal_speed(vx=lin_vel, vy=0, vtheta=math.degrees(ang_vel))
-            mobile_base.send_speed_command()
+            # vtheta would be in degrees/s for reachy2_sdk, ang_vel here is in rad/s
+            print(f"[TEST] lin_vel={lin_vel:+.3f} m/s   ang_vel={ang_vel:+.3f} rad/s "
+                  f"({math.degrees(ang_vel):+.3f} deg/s)   region={region}")
             last_publish = now
 
         cv2.imshow(cam_window, frame)
@@ -402,17 +394,14 @@ def _control_phase(cap, landmarker, bomi_map: BoMIMap, mobile_base) -> None:
         if _quit_requested(key, cam_window) or _quit_requested(key, map_window):
             break
 
-    mobile_base.set_goal_speed(vx=0, vy=0, vtheta=0)
-    mobile_base.send_speed_command()
+    print("[TEST] lin_vel=+0.000 m/s   ang_vel=+0.000 rad/s (+0.000 deg/s)   stop")
     cv2.destroyWindow(cam_window)
     cv2.destroyWindow(map_window)
 
 
 # --- Entry point ---
 def main() -> None:
-    parser = argparse.ArgumentParser(description="BoMI teleop for Reachy2")
-    parser.add_argument("robot_ip", nargs="?", default=DEFAULT_ROBOT_IP,
-                        help=f"IP address of the Reachy robot (default: {DEFAULT_ROBOT_IP})")
+    parser = argparse.ArgumentParser(description="BoMI teleop dry-run (logs velocities, sends nothing)")
     parser.add_argument("--cam", type=int, default=0, help="Webcam index (default: 0)")
     parser.add_argument("--model", default=DEFAULT_MODEL_PATH,
                         help="Path to the MediaPipe hand_landmarker.task model "
@@ -424,14 +413,6 @@ def main() -> None:
         print(f"[ERROR] MediaPipe model not found: '{cli_args.model}'")
         print("        Download hand_landmarker.task and pass its path with --model.")
         sys.exit(1)
-
-    reachy = ReachySDK(host=cli_args.robot_ip)
-    if reachy.mobile_base is None:
-        print(f"[ERROR] No mobile base reported by the robot at '{cli_args.robot_ip}'")
-        reachy.disconnect()
-        sys.exit(1)
-    mobile_base = reachy.mobile_base
-    mobile_base.turn_on()
 
     cap = None
     landmarker = None
@@ -456,16 +437,13 @@ def main() -> None:
         bomi_map.fit(samples)
         print("PCA map fitted")
 
-        _control_phase(cap, landmarker, bomi_map, mobile_base)
+        _control_phase(cap, landmarker, bomi_map)
     finally:
-        mobile_base.set_goal_speed(vx=0, vy=0, vtheta=0)
-        mobile_base.send_speed_command()
         if cap is not None:
             cap.release()
         cv2.destroyAllWindows()
         if landmarker is not None:
             landmarker.close()
-        reachy.disconnect()
 
 
 if __name__ == "__main__":
