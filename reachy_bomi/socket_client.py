@@ -65,13 +65,15 @@ from sklearn.decomposition import PCA
 
 HAND_CONNECTIONS = hand_landmarker.HandLandmarksConnections.HAND_CONNECTIONS
 
-# --- Virtual screen dimensions (must match socket_server expectations) ---
+# --- Virtual screen dimensions ---
 BASE_WIDTH = 2550
 BASE_HEIGHT = 1500
 
 MAX_LINEAR = 1.0      # m/s
 MAX_ANGULAR = 0.8     # rad/s
 DEAD_ZONE_PX = 200    # pixel radius around screen center before motion starts
+
+SEND_HZ = 20 # frequency of sending lin/ang velocities to the second computer (Hz)
 
 # Cursor low-pass filter: 3rd-order
 # Butterworth, coefficients derived from the actual control loop rate below
@@ -82,7 +84,7 @@ CURSOR_FILTER_CUTOFF_HZ = 4.0  # cutoff frequency
 FORMAT = "utf-8"
 DISCONNECT_MESSAGE = "!DISCONNECT"
 
-# Placeholder — replace with the second PC's IP
+# Placeholder — replace with the second computer's IP
 DEFAULT_HOST = "192.168.1.100"
 
 # Calibration files live in a 'calibrations/' folder next to this script
@@ -225,10 +227,11 @@ def _quit_requested(key: int, window_name: str) -> bool:
         return False
 
 
-def _draw_cursor_map(crs_x: float, crs_y: float, region: int,
+def _draw_cursor_map(crs_x: float, crs_y: float, region: int, message: str,
                       map_width: int = 850, map_height: int = 500):
     """Rectangle representing the BASE_WIDTH x BASE_HEIGHT virtual screen, with
-    the 9-region grid lines and a dot at the current cursor position."""
+    the 9-region grid lines, a dot at the current cursor position, and the
+    lin_vel/ang_vel message currently being sent to the robot."""
     canvas = np.full((map_height, map_width, 3), 30, dtype=np.uint8)
     sx = map_width / BASE_WIDTH
     sy = map_height / BASE_HEIGHT
@@ -245,6 +248,8 @@ def _draw_cursor_map(crs_x: float, crs_y: float, region: int,
 
     cv2.putText(canvas, f"region={region}  cursor=({crs_x:.0f},{crs_y:.0f})",
                 (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+    cv2.putText(canvas, f"-> PC2: {message}",
+                (10, 50), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
     return canvas
 
 
@@ -410,7 +415,6 @@ def _calibration_phase(cap, landmarker) -> list:
 
 
 def _control_phase(cap, landmarker, bomi_map: BoMIMap, robot: RobotSocket) -> None:
-    SEND_HZ = 20
     dt = 1.0 / SEND_HZ
     last_send = time.time()
     cursor_filter = CursorFilter()
@@ -420,6 +424,7 @@ def _control_phase(cap, landmarker, bomi_map: BoMIMap, robot: RobotSocket) -> No
     # Start centered (region 5) until the first hand detection updates it.
     crs_x, crs_y = BASE_WIDTH / 2.0, BASE_HEIGHT / 2.0
     region = check_region_cursor(crs_x, crs_y)
+    message = "lin_vel:0.000 ang_vel:0.000"
 
     print("\n=== CONTROL ===  Q = quit")
     robot.send("nine region")
@@ -446,18 +451,22 @@ def _control_phase(cap, landmarker, bomi_map: BoMIMap, robot: RobotSocket) -> No
             lin_vel, ang_vel = apply_region_velocity_mask(region, lin_vel, ang_vel)
 
             cv2.putText(
-                frame,
-                f"region={region}  lin={lin_vel:.2f}  ang={ang_vel:.2f}",
+                frame, f"region={region}  cursor=({crs_x:.0f},{crs_y:.0f})",
                 (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2,
+            )
+            cv2.putText(
+                frame, f"-> PC2: {message}",
+                (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2,
             )
 
         now = time.time()
         if now - last_send >= dt:
-            robot.send(f"lin_vel:{lin_vel:.3f} ang_vel:{ang_vel:.3f}")
+            message = f"lin_vel:{lin_vel:.3f} ang_vel:{ang_vel:.3f}"
+            robot.send(message)
             last_send = now
 
         cv2.imshow(cam_window, frame)
-        cv2.imshow(map_window, _draw_cursor_map(crs_x, crs_y, region))
+        cv2.imshow(map_window, _draw_cursor_map(crs_x, crs_y, region, message))
 
         key = cv2.waitKey(1) & 0xFF
         if _quit_requested(key, cam_window) or _quit_requested(key, map_window):
