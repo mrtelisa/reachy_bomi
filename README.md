@@ -49,6 +49,14 @@ The **velocity computation does not depend on the scenario** — the scenario on
 ```bash
 pip install mediapipe opencv-python scikit-learn numpy scipy
 ```
+If necessary, create a virtual environment.
+
+`socket_client.py` uses the MediaPipe **Tasks API** (`HandLandmarker`), which needs a `hand_landmarker.task` model file — it's not bundled with the `mediapipe` pip package. Download it once and point `--model` at it (default: `scripts/hand_landmarker.task` inside the package):
+
+```bash
+curl -o scripts/hand_landmarker.task \
+  https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/latest/hand_landmarker.task
+```
 
 Both machines must be on the **same network** and able to reach each other on the TCP port (default `5051`).
 
@@ -96,11 +104,12 @@ Launch arguments:
 
 ```bash
 # First time (or to recalibrate): run the calibration phase and save it
-python3 socket_client.py <robot_ip> --calibrate [--calib bomi_calib.npz] [--port 5051] [--cam 0] \
+python3 socket_client.py <robot_ip> --calibrate [--calib bomi_calib.npz] [--model scripts/hand_landmarker.task] \
+    [--port 5051] [--cam 0] \
     [--scenario familiarization] [--start-rviz true] [--record true] [--sim-wait 25]
 
 # Next times: load the saved calibration, skip straight to control
-python3 socket_client.py <robot_ip> [--port 5051] [--cam 0] \
+python3 socket_client.py <robot_ip> [--model scripts/hand_landmarker.task] [--port 5051] [--cam 0] \
     [--scenario familiarization] [--start-rviz true] [--record true] [--sim-wait 25]
 ```
 
@@ -109,9 +118,9 @@ python3 socket_client.py <robot_ip> [--port 5051] [--cam 0] \
 `--calibrate` is **opt-in**: without it, `socket_client.py` skips Phase 1 entirely and loads the saved calibration file (`--calib`, a bare filename is stored in the package's `calibrations/` folder; default `bomi_calib.npz`) — it fails immediately if that file doesn't exist yet. Pass `--calibrate` the first time, or whenever you want to redo it.
 
 **Phase 1 — Calibration** (only with `--calibrate`): move your hand through all the positions you intend to use.
-`SPACE` records a sample, `ENTER` finishes (minimum 30 samples), `Q` quits.
+`SPACE` records a sample, `ENTER` finishes (minimum 30 samples), `Q`/`Esc`/closing the window quits.
 
-**Phase 2 — Control:** your hand drives the cursor; the cursor position is mapped to base velocities and streamed to the robot. Press `Q` to stop the robot and quit.
+**Phase 2 — Control:** your hand drives the cursor; the cursor position is mapped to base velocities and streamed to the robot. Two windows are shown: the webcam feed with the hand landmarks, and a map of the virtual screen with the 9-region grid lines and a dot at the current cursor position. Press `Q`/`Esc`, or close either window, to stop the robot and quit.
 
 The control area is a 3×3 grid with a dead zone in the centre:
 
@@ -156,7 +165,8 @@ reachy_bomi/
 ├── scripts/                        # offline analysis tools (not part of runtime)
 │   ├── extract_path.py
 │   ├── trajectory_map_collisions.py
-│   └── export_collision_events_csv.py
+│   ├── export_collision_events_csv.py
+│   └── hand_landmarker.task        # MediaPipe model (download separately, see Requirements)
 ├── worlds/                         # Gazebo world files
 ├── resource/
 │   └── reachy_bomi                 # ament resource marker

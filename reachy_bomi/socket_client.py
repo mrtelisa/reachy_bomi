@@ -21,6 +21,8 @@ Usage:
         --calib PATH           Calibration file. A bare filename is saved in the
                                calibrations/ folder inside the package.
                                Default: bomi_calib.npz
+        --model PATH           Path to the MediaPipe hand_landmarker.task model.
+                               Default: scripts/hand_landmarker.task inside the package.
         --port PORT            Robot socket port. Default: 5051
         --cam INDEX            Webcam index. Default: 0
         --scenario NAME        Scenario name to send to the robot right after connecting
@@ -40,7 +42,10 @@ Phase 1 - Calibration (only with --calibrate):
 
 Phase 2 - Control:
     Hand movement -> PCA cursor -> 9-region velocity -> TCP socket to robot.
-    Q = quit and stop robot.
+    Opens two windows: the webcam feed with landmarks, and a map of the
+    virtual screen with the 9-region grid lines and a dot at the current
+    cursor position.
+    Q, ESC, or closing a window with the X = quit and stop robot.
 """
 
 import argparse
@@ -53,7 +58,12 @@ import cv2
 import mediapipe as mp
 import numpy as np
 import scipy.signal as sgn
+from mediapipe.tasks.python.core import base_options
+from mediapipe.tasks.python.vision import hand_landmarker
+from mediapipe.tasks.python.vision.core import vision_task_running_mode
 from sklearn.decomposition import PCA
+
+HAND_CONNECTIONS = hand_landmarker.HandLandmarksConnections.HAND_CONNECTIONS
 
 # --- Virtual screen dimensions (must match socket_server expectations) ---
 BASE_WIDTH = 2550
@@ -72,7 +82,7 @@ CURSOR_FILTER_CUTOFF_HZ = 4.0  # cutoff frequency
 FORMAT = "utf-8"
 DISCONNECT_MESSAGE = "!DISCONNECT"
 
-# Placeholder — replace with Reachy's actual IP on your network.
+# Placeholder — replace with the second PC's IP
 DEFAULT_HOST = "192.168.1.100"
 
 # Calibration files live in a 'calibrations/' folder next to this script
@@ -80,6 +90,12 @@ DEFAULT_HOST = "192.168.1.100"
 # a --calib value that already contains a path is used as-is.
 CALIB_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "calibrations")
 DEFAULT_CALIB_FILE = "bomi_calib.npz"
+
+# MediaPipe Tasks hand-landmarker model (.task), lives in the 'scripts/' folder
+# next to this package by default.
+DEFAULT_MODEL_PATH = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "..", "scripts", "hand_landmarker.task"
+)
 
 
 def _resolve_calib_path(calib_arg: str) -> str:
@@ -174,9 +190,62 @@ def _extract_hand_features(hand_landmarks, mirror_x: bool = False) -> np.ndarray
     Flatten all 21 hand landmarks (x, y) into a 42-element vector.
     If mirror_x, x is mirrored (1 - x) so the right hand maps to the same
     feature space as the left hand.
+
+    hand_landmarks is the list of NormalizedLandmark returned by MediaPipe
+    Tasks (e.g. results.hand_landmarks[0]).
     """
-    coords = [[1.0 - lm.x if mirror_x else lm.x, lm.y] for lm in hand_landmarks.landmark]
+    coords = [[1.0 - lm.x if mirror_x else lm.x, lm.y] for lm in hand_landmarks]
     return np.array(coords).flatten()
+
+
+def _draw_hand_landmarks(frame, landmarks) -> None:
+    """Draw MediaPipe Tasks hand landmarks/connections on a BGR OpenCV frame."""
+    height, width = frame.shape[:2]
+    points = []
+
+    for landmark in landmarks:
+        x = min(max(int(landmark.x * width), 0), width - 1)
+        y = min(max(int(landmark.y * height), 0), height - 1)
+        points.append((x, y))
+
+    for connection in HAND_CONNECTIONS:
+        cv2.line(frame, points[connection.start], points[connection.end], (0, 200, 255), 2)
+
+    for point in points:
+        cv2.circle(frame, point, 4, (0, 255, 0), -1)
+
+
+def _quit_requested(key: int, window_name: str) -> bool:
+    """True if Q/ESC was pressed, or the window was closed with the X button."""
+    if key in (ord('q'), ord('Q'), 27):
+        return True
+    try:
+        return cv2.getWindowProperty(window_name, cv2.WND_PROP_VISIBLE) < 1
+    except cv2.error:
+        return False
+
+
+def _draw_cursor_map(crs_x: float, crs_y: float, region: int,
+                      map_width: int = 850, map_height: int = 500):
+    """Rectangle representing the BASE_WIDTH x BASE_HEIGHT virtual screen, with
+    the 9-region grid lines and a dot at the current cursor position."""
+    canvas = np.full((map_height, map_width, 3), 30, dtype=np.uint8)
+    sx = map_width / BASE_WIDTH
+    sy = map_height / BASE_HEIGHT
+
+    x1, x2 = int(847 * sx), int(1697 * sx)
+    y1, y2 = int(497 * sy), int(997 * sy)
+    for x in (x1, x2):
+        cv2.line(canvas, (x, 0), (x, map_height), (90, 90, 90), 1)
+    for y in (y1, y2):
+        cv2.line(canvas, (0, y), (map_width, y), (90, 90, 90), 1)
+
+    cx, cy = int(crs_x * sx), int(crs_y * sy)
+    cv2.circle(canvas, (cx, cy), 10, (0, 0, 255), -1)
+
+    cv2.putText(canvas, f"region={region}  cursor=({crs_x:.0f},{crs_y:.0f})",
+                (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+    return canvas
 
 
 class CursorFilter:
@@ -294,7 +363,7 @@ class RobotSocket:
 
 
 # --- Phases ---
-def _calibration_phase(cap, hands) -> list:
+def _calibration_phase(cap, landmarker) -> list:
     MIN_SAMPLES = 30
     samples = []
 
@@ -307,22 +376,22 @@ def _calibration_phase(cap, hands) -> list:
         if not ret:
             continue
         frame = cv2.flip(frame, 1)
-        results = hands.process(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+        rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb_frame)
+        results = landmarker.detect_for_video(mp_image, int(time.time() * 1000))
 
-        if results.multi_hand_landmarks:
-            mp.solutions.drawing_utils.draw_landmarks(
-                frame, results.multi_hand_landmarks[0],
-                mp.solutions.hands.HAND_CONNECTIONS,
-            )
+        if results.hand_landmarks:
+            _draw_hand_landmarks(frame, results.hand_landmarks[0])
 
         label = f"Samples: {len(samples)}/{MIN_SAMPLES}  SPACE=add  ENTER=done  Q=quit"
         cv2.putText(frame, label, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 255, 0), 2)
-        cv2.imshow("BoMI - Calibration", frame)
+        window_name = "BoMI - Calibration"
+        cv2.imshow(window_name, frame)
         key = cv2.waitKey(1) & 0xFF
 
-        if key == ord(' ') and results.multi_hand_landmarks:
-            mirror_x = results.multi_handedness[0].classification[0].label == "Right"
-            samples.append(_extract_hand_features(results.multi_hand_landmarks[0], mirror_x))
+        if key == ord(' ') and results.hand_landmarks:
+            mirror_x = results.handedness[0][0].category_name == "Right"
+            samples.append(_extract_hand_features(results.hand_landmarks[0], mirror_x))
             print(f"  Sample {len(samples)} recorded")
 
         elif key == 13:  # ENTER
@@ -332,19 +401,25 @@ def _calibration_phase(cap, hands) -> list:
             else:
                 print(f"  Need at least {MIN_SAMPLES} samples (have {len(samples)})")
 
-        elif key == ord('q'):
+        elif _quit_requested(key, window_name):
             print("Aborted.")
             sys.exit(0)
 
-    cv2.destroyWindow("BoMI - Calibration")
+    cv2.destroyWindow(window_name)
     return samples
 
 
-def _control_phase(cap, hands, bomi_map: BoMIMap, robot: RobotSocket) -> None:
+def _control_phase(cap, landmarker, bomi_map: BoMIMap, robot: RobotSocket) -> None:
     SEND_HZ = 20
     dt = 1.0 / SEND_HZ
     last_send = time.time()
     cursor_filter = CursorFilter()
+    cam_window = "BoMI - Control"
+    map_window = "BoMI - Cursor Map"
+
+    # Start centered (region 5) until the first hand detection updates it.
+    crs_x, crs_y = BASE_WIDTH / 2.0, BASE_HEIGHT / 2.0
+    region = check_region_cursor(crs_x, crs_y)
 
     print("\n=== CONTROL ===  Q = quit")
     robot.send("nine region")
@@ -354,16 +429,16 @@ def _control_phase(cap, hands, bomi_map: BoMIMap, robot: RobotSocket) -> None:
         if not ret:
             continue
         frame = cv2.flip(frame, 1)
-        results = hands.process(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+        rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb_frame)
+        results = landmarker.detect_for_video(mp_image, int(time.time() * 1000))
 
         lin_vel, ang_vel = 0.0, 0.0
 
-        if results.multi_hand_landmarks:
-            hl = results.multi_hand_landmarks[0]
-            mp.solutions.drawing_utils.draw_landmarks(
-                frame, hl, mp.solutions.hands.HAND_CONNECTIONS
-            )
-            mirror_x = results.multi_handedness[0].classification[0].label == "Right"
+        if results.hand_landmarks:
+            hl = results.hand_landmarks[0]
+            _draw_hand_landmarks(frame, hl)
+            mirror_x = results.handedness[0][0].category_name == "Right"
             crs_x, crs_y = bomi_map.transform(_extract_hand_features(hl, mirror_x))
             crs_x, crs_y = cursor_filter.update(crs_x, crs_y)
             region = check_region_cursor(crs_x, crs_y)
@@ -381,12 +456,16 @@ def _control_phase(cap, hands, bomi_map: BoMIMap, robot: RobotSocket) -> None:
             robot.send(f"lin_vel:{lin_vel:.3f} ang_vel:{ang_vel:.3f}")
             last_send = now
 
-        cv2.imshow("BoMI - Control", frame)
-        if cv2.waitKey(1) & 0xFF == ord('q'):
+        cv2.imshow(cam_window, frame)
+        cv2.imshow(map_window, _draw_cursor_map(crs_x, crs_y, region))
+
+        key = cv2.waitKey(1) & 0xFF
+        if _quit_requested(key, cam_window) or _quit_requested(key, map_window):
             break
 
     robot.send("lin_vel:0.000 ang_vel:0.000")
-    cv2.destroyWindow("BoMI - Control")
+    cv2.destroyWindow(cam_window)
+    cv2.destroyWindow(map_window)
 
 
 # --- Entry point ---
@@ -401,6 +480,9 @@ def main() -> None:
     parser.add_argument("--calib", default=DEFAULT_CALIB_FILE,
                         help="Calibration file. A bare filename is stored in the "
                              f"calibrations/ folder inside the package (default: {DEFAULT_CALIB_FILE}).")
+    parser.add_argument("--model", default=DEFAULT_MODEL_PATH,
+                        help="Path to the MediaPipe hand_landmarker.task model "
+                             f"(default: {DEFAULT_MODEL_PATH}).")
     parser.add_argument("--scenario", default=None,
                         help="Scenario name to send to the robot right after connecting "
                              "(e.g. 'familiarization'). Omit to skip sending a scenario.")
@@ -425,9 +507,15 @@ def main() -> None:
         print(f"        python3 socket_client.py {args.server_ip} --calibrate")
         sys.exit(1)
 
+    # Fail early if the hand-landmarker model is missing
+    if not os.path.exists(args.model):
+        print(f"[ERROR] MediaPipe model not found: '{args.model}'")
+        print("        Download hand_landmarker.task and pass its path with --model.")
+        sys.exit(1)
+
     robot = RobotSocket(args.server_ip, args.port)
     cap = None
-    hands = None
+    landmarker = None
     try:
         if args.scenario:
             scenario_msg = f"scenario:{args.scenario} rviz:{args.start_rviz} record:{args.record}"
@@ -441,15 +529,19 @@ def main() -> None:
             print(f"[ERROR] Cannot open camera {args.cam}")
             sys.exit(1)
 
-        hands = mp.solutions.hands.Hands(
-            static_image_mode=False,
-            max_num_hands=1,
-            min_detection_confidence=0.7,
+        landmarker_options = hand_landmarker.HandLandmarkerOptions(
+            base_options=base_options.BaseOptions(model_asset_path=args.model),
+            running_mode=vision_task_running_mode.VisionTaskRunningMode.VIDEO,
+            num_hands=1,
+            min_hand_detection_confidence=0.7,
+            min_hand_presence_confidence=0.5,
+            min_tracking_confidence=0.5,
         )
+        landmarker = hand_landmarker.HandLandmarker.create_from_options(landmarker_options)
 
         bomi_map = BoMIMap()
         if args.calibrate:
-            samples = _calibration_phase(cap, hands)
+            samples = _calibration_phase(cap, landmarker)
             bomi_map.fit(samples)
             os.makedirs(os.path.dirname(calib_path) or ".", exist_ok=True)
             bomi_map.save(calib_path)
@@ -458,14 +550,14 @@ def main() -> None:
             bomi_map.load(calib_path)
             print(f"Loaded calibration from {calib_path} (no calibration phase)")
 
-        _control_phase(cap, hands, bomi_map, robot)
+        _control_phase(cap, landmarker, bomi_map, robot)
     finally:
         robot.close()
         if cap is not None:
             cap.release()
         cv2.destroyAllWindows()
-        if hands is not None:
-            hands.close()
+        if landmarker is not None:
+            landmarker.close()
 
 
 if __name__ == "__main__":
