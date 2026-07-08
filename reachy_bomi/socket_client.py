@@ -357,7 +357,9 @@ class RobotSocket:
         print(f"[SOCKET] Connected to {host}:{port}")
 
     def send(self, msg: str) -> None:
-        self._sock.sendall(msg.encode(FORMAT))
+        # '\n' delimiter so socket_server.py can tell separate messages apart
+        # even if TCP coalesces/splits them across recv() calls.
+        self._sock.sendall((msg + "\n").encode(FORMAT))
 
     def close(self) -> None:
         try:

@@ -12,7 +12,10 @@ class CmdVelPublisher(Node):
 
         self.linear_vel = 0.0
         self.angular_vel = 0.0
-        self.base_state = -1.0
+        # Defaults to velocity mode: this deployment only ever uses cmd_vel
+        # teleop, so there's no need to wait for the "nine region" handshake
+        # from socket_server before /cmd_vel starts being published.
+        self.base_state = 1.0
 
         self.cmd_vel_pub = self.create_publisher(Twist, "/cmd_vel", 10)
 
@@ -20,7 +23,9 @@ class CmdVelPublisher(Node):
         self.create_subscription(Float32, "socket_server/linear_vel", self._linear_vel_cb, 10)
         self.create_subscription(Float32, "socket_server/angular_vel", self._ang_vel_cb, 10)
 
-        self.timer = self.create_timer(0.1, self._control_loop)
+        # Matches SEND_HZ in socket_client.py so /cmd_vel republishes at the
+        # same rate the operator PC actually computes velocities
+        self.timer = self.create_timer(1.0 / 20, self._control_loop)
         self.get_logger().info("Reachy base controller started")
 
     def _base_state_cb(self, msg: Float32) -> None:

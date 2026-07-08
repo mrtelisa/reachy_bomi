@@ -74,15 +74,23 @@ class ServerSocketNode(Node):
 
     def _handle_client(self, conn: socket.socket) -> None:
         connected = True
+        # Buffer across recv() calls: TCP is a byte stream, a single recv()
+        # can contain multiple '\n'-delimited messages, a partial one, or both.
+        buffer = ""
         try:
             while connected and rclpy.ok():
                 data = conn.recv(1024)
                 if not data:
                     break
-                msg = data.decode(FORMAT).strip()
-                self._decode_msg(msg)
-                if msg == DISCONNECT_MESSAGE:
-                    connected = False
+                buffer += data.decode(FORMAT)
+                while "\n" in buffer:
+                    msg, buffer = buffer.split("\n", 1)
+                    msg = msg.strip()
+                    if not msg:
+                        continue
+                    self._decode_msg(msg)
+                    if msg == DISCONNECT_MESSAGE:
+                        connected = False
         finally:
             conn.close()
             # Whatever the reason the client went away (clean disconnect, closed
