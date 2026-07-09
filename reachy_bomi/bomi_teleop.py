@@ -52,6 +52,10 @@ from sklearn.decomposition import PCA
 
 HAND_CONNECTIONS = hand_landmarker.HandLandmarksConnections.HAND_CONNECTIONS
 
+# --- Lidar safety ---
+LIDAR_SLOWDOWN_DISTANCE = 0.7   # m
+LIDAR_CRITICAL_DISTANCE = 0.55  # m
+
 # --- Virtual screen dimensions ---
 BASE_WIDTH = 2550
 BASE_HEIGHT = 1500
@@ -435,6 +439,9 @@ def main() -> None:
         reachy.disconnect()
         sys.exit(1)
     mobile_base = reachy.mobile_base
+    mobile_base.lidar.safety_enabled = True
+    mobile_base.lidar.safety_slowdown_distance = LIDAR_SLOWDOWN_DISTANCE
+    mobile_base.lidar.safety_critical_distance = LIDAR_CRITICAL_DISTANCE
     mobile_base.turn_on()
 
     cap = None
