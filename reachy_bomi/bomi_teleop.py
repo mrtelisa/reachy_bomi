@@ -74,7 +74,7 @@ DEFAULT_MODEL_PATH = os.path.join(
 )
 
 # Placeholder — replace with the robot's actual IP.
-DEFAULT_ROBOT_IP = "192.168.1.100"
+DEFAULT_ROBOT_IP = "192.168.0.116"
 
 
 # --- Velocity helpers (adapted from reaching_functions.py) ---------
@@ -289,8 +289,12 @@ class BoMIMap:
         self.fitted = True
 
     def transform(self, features: np.ndarray) -> tuple:
-        cu = np.dot(features - self._mean, self._components.T)
-        cu = cu * self._scale + self._offset
+        """
+        Linear BoMI map: raw hand landmarks -> 2D cursor in screen space.
+        Returns (crs_x, crs_y) in pixels, clipped to the screen size
+        """
+        cu = np.dot(features - self._mean, self._components.T) # Linear projection of the features onto the PCA components
+        cu = cu * self._scale + self._offset # Scaling operation to map the PCA scores to the screen size
         crs_x = float(np.clip(cu[0], 0, BASE_WIDTH))
         crs_y = float(np.clip(cu[1], 0, BASE_HEIGHT))
         return crs_x, crs_y
