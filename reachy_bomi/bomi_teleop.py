@@ -26,7 +26,14 @@ Phase 1 - Calibration (always runs first):
     Move your hand through all positions you intend to use.
     SPACE = record sample   |   ENTER = finish (min 30 samples required)
 
-Phase 2 - Control:
+Phase 2 - Cursor preview (no robot motion):
+    Same cursor/region view as Control, but nothing is sent to the robot.
+    Use this to get a feel for the cursor before it starts driving the base.
+    Opens the same cam/map windows used by Control; they stay open across the
+    ENTER press below rather than closing and reopening.
+    ENTER = proceed to Control   |   Q, ESC, or closing a window = quit
+
+Phase 3 - Control:
     Hand movement -> PCA cursor -> 9-region velocity -> mobile base.
     Opens two windows: the webcam feed with landmarks, and a map of the
     virtual screen with the 9-region grid lines and a dot at the current
@@ -60,7 +67,7 @@ LIDAR_CRITICAL_DISTANCE = 0.55  # m
 BASE_WIDTH = 2550
 BASE_HEIGHT = 1500
 
-MAX_LINEAR = 1.0      # m/s
+MAX_LINEAR = 0.6     # m/s
 MAX_ANGULAR = 0.8     # rad/s
 DEAD_ZONE_PX = 200    # pixel radius around screen center before motion starts
 
@@ -78,7 +85,12 @@ DEFAULT_MODEL_PATH = os.path.join(
 )
 
 # Placeholder — replace with the robot's actual IP.
-DEFAULT_ROBOT_IP = "192.168.0.116"
+DEFAULT_ROBOT_IP = "192.168.0.120"
+
+# Shared window names for the cursor preview and control phases, so the same
+# OS windows stay open across the transition instead of closing and reopening.
+CAM_WINDOW_NAME = "BoMI - Camera"
+MAP_WINDOW_NAME = "BoMI - Cursor Map"
 
 
 # --- Velocity helpers (adapted from reaching_functions.py) ---------
@@ -350,13 +362,68 @@ def _calibration_phase(cap, landmarker) -> list:
     cv2.destroyWindow(window_name)
     return samples
 
+def _cursor_preview_phase(cap, landmarker, bomi_map: BoMIMap) -> None:
+    """
+    Shows the same cursor/region view as the control phase, but never talks to
+    the robot. Lets the user get a feel for the cursor and see where it starts
+    out before enabling motion.
+    """
+    cursor_filter = CursorFilter()
+    cam_window = CAM_WINDOW_NAME
+    map_window = MAP_WINDOW_NAME
+
+    crs_x, crs_y = BASE_WIDTH / 2.0, BASE_HEIGHT / 2.0
+    region = check_region_cursor(crs_x, crs_y)
+
+    print("\n=== CURSOR PREVIEW (robot not moving) ===")
+    print("Get a feel for the cursor. ENTER = start Control   |   Q = quit")
+
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            continue
+        frame = cv2.flip(frame, 1)
+        rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb_frame)
+        results = landmarker.detect_for_video(mp_image, int(time.time() * 1000))
+
+        if results.hand_landmarks:
+            hl = results.hand_landmarks[0]
+            _draw_hand_landmarks(frame, hl)
+            mirror_x = results.handedness[0][0].category_name == "Right"
+            crs_x, crs_y = bomi_map.transform(_extract_hand_features(hl, mirror_x))
+            crs_x, crs_y = cursor_filter.update(crs_x, crs_y)
+            region = check_region_cursor(crs_x, crs_y)
+
+        cv2.putText(
+            frame, f"region={region}  cursor=({crs_x:.0f},{crs_y:.0f})",
+            (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2,
+        )
+        cv2.putText(
+            frame, "PREVIEW - robot not moving. ENTER=start control  Q=quit",
+            (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2,
+        )
+
+        cv2.imshow(cam_window, frame)
+        cv2.imshow(map_window, _draw_cursor_map(crs_x, crs_y, region, "(preview - not sent)"))
+
+        key = cv2.waitKey(1) & 0xFF
+        if key == 13:  # ENTER
+            break
+        if _quit_requested(key, cam_window) or _quit_requested(key, map_window):
+            print("Aborted.")
+            sys.exit(0)
+
+    # Windows are intentionally left open (no destroyWindow) so the same cam/map
+    # windows carry straight into the control phase instead of flickering shut.
+
 
 def _control_phase(cap, landmarker, bomi_map: BoMIMap, mobile_base) -> None:
     dt = 1.0 / PUBLISH_HZ
     last_publish = time.time()
     cursor_filter = CursorFilter()
-    cam_window = "BoMI - Control"
-    map_window = "BoMI - Cursor Map"
+    cam_window = CAM_WINDOW_NAME
+    map_window = MAP_WINDOW_NAME
 
     # Start centered (region 5) until the first hand detection updates it.
     crs_x, crs_y = BASE_WIDTH / 2.0, BASE_HEIGHT / 2.0
@@ -467,6 +534,7 @@ def main() -> None:
         bomi_map.fit(samples)
         print("PCA map fitted")
 
+        _cursor_preview_phase(cap, landmarker, bomi_map)
         _control_phase(cap, landmarker, bomi_map, mobile_base)
     finally:
         mobile_base.set_goal_speed(vx=0, vy=0, vtheta=0)

@@ -68,12 +68,14 @@ ros2 run reachy_bomi bomi_teleop [robot_ip] [--model hand_landmarker.task] [--ca
 
 `robot_ip` is optional if you've set `DEFAULT_ROBOT_IP` in `bomi_teleop.py` to your robot's IP; otherwise pass it explicitly.
 
-Every run starts with the calibration phase, then goes straight into control — the PCA map is only kept in memory for that run, not saved or reloaded.
+Every run starts with calibration, then a cursor preview, then goes into control — the PCA map is only kept in memory for that run, not saved or reloaded.
 
 **Phase 1 — Calibration** (always runs first): move your hand through all the positions you intend to use.
 `SPACE` records a sample, `ENTER` finishes (minimum 30 samples), `Q`/`Esc`/closing the window quits.
 
-**Phase 2 — Control:** your hand drives the cursor; the cursor position is mapped to base velocities and sent to the robot. Two windows are shown: the webcam feed with the hand landmarks, and a map of the virtual screen with the 9-region grid lines and a dot at the current cursor position. Press `Q`/`Esc`, or close either window, to stop the robot and quit.
+**Phase 2 — Cursor preview:** the same webcam and cursor-map windows used in Control are shown, but nothing is sent to the robot yet. Use this to get a feel for the cursor and see where it currently sits before motion is enabled. Press `ENTER` to proceed into Control — the same windows stay open (no closing/reopening) — or `Q`/`Esc`/close a window to quit.
+
+**Phase 3 — Control:** your hand drives the cursor; the cursor position is mapped to base velocities and sent to the robot. Two windows are shown: the webcam feed with the hand landmarks, and a map of the virtual screen with the 9-region grid lines and a dot at the current cursor position. Press `Q`/`Esc`, or close either window, to stop the robot and quit.
 
 The control area is a 3×3 grid with a dead zone in the centre:
 
