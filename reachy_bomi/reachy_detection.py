@@ -459,11 +459,11 @@ def build_object_point_cloud(
           f"{valid_after:.0f}% (after {num_frames}-frame fusion)")
 
     # Diagnostic plots for the 4 pipeline stages are commented out
-    # raw_cloud = _depth_crop_to_point_cloud(depth_cam, fused_crop, padded_box, correct_distortion=False)
-    # graphs.show_point_cloud(raw_cloud, f"{class_name} - 1 acquired")
+    raw_cloud = _depth_crop_to_point_cloud(depth_cam, fused_crop, padded_box, correct_distortion=False)
+    graphs.show_point_cloud(raw_cloud, f"{class_name} - 1 acquired")
 
     point_cloud = _depth_crop_to_point_cloud(depth_cam, fused_crop, padded_box)
-    # graphs.show_point_cloud(point_cloud, f"{class_name} - 2 after removing distortion")
+    graphs.show_point_cloud(point_cloud, f"{class_name} - 2 after removing distortion")
 
     points_before_isolation = len(point_cloud)
     point_cloud = _remove_flying_pixels(point_cloud)
@@ -475,12 +475,12 @@ def build_object_point_cloud(
               f"{tilt_deg:.0f} deg from vertical  [{verdict}]")
     else:
         print("Table normal: not fitted (too few points) -- reachy_grasp will fall back to a vertical assumption")
-    # graphs.show_point_cloud(point_cloud, f"{class_name} - 3 after background isolation")
+    graphs.show_point_cloud(point_cloud, f"{class_name} - 3 after background isolation")
 
     point_cloud = _largest_cluster(point_cloud)
     print(f"Point cloud: {points_before_isolation} points (distortion-corrected) -> "
           f"{len(point_cloud)} (table + flying pixels removed, largest cluster kept)")
-    # graphs.show_point_cloud(point_cloud, f"{class_name} - 4 final")
+    graphs.show_point_cloud(point_cloud, f"{class_name} - 4 final")
 
     shape = _shape_from_class(class_name)
     width_m, height_m, centroid, axes = _object_dimensions(point_cloud, shape)

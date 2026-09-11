@@ -79,7 +79,7 @@ import safety
 import bomi_teleop
 
 # Placeholder — replace with the robot's actual IP
-DEFAULT_ROBOT_IP = "130.251.6.85"
+DEFAULT_ROBOT_IP = "192.168.0.121"
 
 # How long the cursor must stay in region 5 before Control moves to the next step
 SELECTION_HOLD_SECONDS = reachy_selection.DWELL_HOLD_SECONDS

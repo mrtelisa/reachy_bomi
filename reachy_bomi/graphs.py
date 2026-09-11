@@ -1,8 +1,22 @@
 #!/usr/bin/env python3
 """All matplotlib plotting for the grasp pipeline."""
 
+import os
+import re
+import time
+
 import matplotlib.pyplot as plt
 import numpy as np
+
+GRAPHS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "graphs")
+
+
+def _save_fig(fig, name: str) -> None:
+    """Save fig to GRAPHS_DIR as <timestamp>_<slug>.png, creating the dir if needed."""
+    os.makedirs(GRAPHS_DIR, exist_ok=True)
+    slug = re.sub(r"[^\w.-]+", "_", name).strip("_")
+    filename = f"{time.strftime('%Y%m%d_%H%M%S')}_{slug}.png"
+    fig.savefig(os.path.join(GRAPHS_DIR, filename), dpi=150, bbox_inches="tight")
 
 
 def show_point_cloud(point_cloud: np.ndarray, class_name: str) -> None:
@@ -31,6 +45,8 @@ def show_point_cloud(point_cloud: np.ndarray, class_name: str) -> None:
     ax.set_xlim(mid[0] - half_range, mid[0] + half_range)
     ax.set_ylim(mid[1] - half_range, mid[1] + half_range)
     ax.set_zlim(mid[2] - half_range, mid[2] + half_range)
+
+    _save_fig(fig, f"point_cloud_{class_name}")
 
     plt.show(block=False)
     plt.pause(0.001)
@@ -73,6 +89,8 @@ def show_grasp_plan(geometry, plan) -> None:
     ax.set_xlim(mid[0] - half_range, mid[0] + half_range)
     ax.set_ylim(mid[1] - half_range, mid[1] + half_range)
     ax.set_zlim(mid[2] - half_range, mid[2] + half_range)
+
+    _save_fig(fig, f"grasp_plan_{geometry.class_name}_{plan.arm_name}")
 
     plt.show(block=False)
     # Several short pauses, not one: gives the window manager more chances

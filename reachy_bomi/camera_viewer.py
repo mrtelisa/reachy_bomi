@@ -23,7 +23,7 @@ from reachy2_sdk import ReachySDK
 import safety
 import stream
 
-DEFAULT_ROBOT_IP = "130.251.6.85"
+DEFAULT_ROBOT_IP = "192.168.0.121"
 WINDOW_NAME_HEAD = "Reachy - Head Camera (LEFT)"
 WINDOW_NAME_TORSO = "Reachy - Torso Camera (LEFT)"
 
