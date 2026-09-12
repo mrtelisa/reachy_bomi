@@ -207,7 +207,7 @@ def _run_grasp_mode(cap, landmarker, bomi_map, cursor_filter, depth_cam, model, 
                         print(f"[{class_name}] no feasible grasp (too wide for the gripper, "
                               "or its pose couldn't be estimated)")
                     else:
-                        graphs.show_grasp_plan(geometry, plan)
+                        #graphs.show_grasp_plan(geometry, plan)
                         if reachy_grasp.execute_grasp(reachy, plan):
                             _place_back_and_wind_down(reachy, mobile_base, plan)
                 break
@@ -236,12 +236,9 @@ def _place_back_and_wind_down(reachy, mobile_base, plan: reachy_grasp.GraspPlan)
         time.sleep(0.1)
 
     print(f"\nRotating the base {safety.SHUTDOWN_ROTATION_DEG:.0f} deg...")
-    try:
-        mobile_base.turn_on()
-        mobile_base.translate_by(x=-REVERSE_BASE_CM / 100.0, y=0.0, wait=True) 
-        mobile_base.rotate_by(safety.SHUTDOWN_ROTATION_DEG, wait=True)
-    except Exception as exc:
-        print(f"[WARN] Could not rotate the base ({exc}).")
+    # Goes through the shared gate so a concurrent ESC-triggered shutdown
+    # (racing on another thread) can't also rotate the base a second time.
+    safety.rotate_base_once(mobile_base, reverse_cm=REVERSE_BASE_CM)
 
     print("\nReturning to default posture...")
     reachy.goto_posture("default", duration=3.0, wait=True)

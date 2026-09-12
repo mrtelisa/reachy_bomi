@@ -231,7 +231,7 @@ def _test_grasp_planning(reachy: ReachySDK, model: YOLO, confidence: float) -> N
                     rounded = [[round(float(v), 6) for v in row] for row in plan.pregrasp_matrix.tolist()]
                     print(f"[{class_name}] pregrasp target for {plan.arm_name}: np.array({rounded})")
 
-                    graphs.show_grasp_plan(geometry, plan)
+                    #graphs.show_grasp_plan(geometry, plan)
                     if reachy_grasp.execute_grasp(reachy, plan):
                         _place_back_and_wind_down(reachy, plan)
                         break

@@ -29,6 +29,27 @@ SHUTDOWN_ROTATION_DEG = 180.0
 
 _wmctrl_missing_warned = False
 
+_rotation_lock = threading.Lock()
+_rotation_done = False
+
+
+def rotate_base_once(mobile_base, reverse_cm: float = SHUTDOWN_REVERSE_CM) -> None:
+    """Translate back + rotate SHUTDOWN_ROTATION_DEG, but only the first time
+    this is called in the whole process -- guards against the wind-down
+    rotation and an ESC-triggered shutdown (or two quit watchers) firing at
+    the same time and rotating the base twice."""
+    global _rotation_done
+    with _rotation_lock:
+        if _rotation_done or mobile_base is None:
+            return
+        _rotation_done = True
+    try:
+        mobile_base.turn_on()
+        mobile_base.translate_by(x=-reverse_cm / 100.0, y=0.0, wait=True)
+        mobile_base.rotate_by(SHUTDOWN_ROTATION_DEG, wait=True)
+    except Exception as exc:
+        print(f"[WARN] Could not rotate the base ({exc}).")
+
 
 def force_fullscreen(window_name: str) -> None:
     """Requests the EWMH fullscreen state via wmctrl. Some Qt/opencv-python
@@ -150,9 +171,10 @@ def safe_robot_shutdown(reachy: ReachySDK, mobile_base=None, rotate_base_before_
     """Stop the base, then power down smoothly. Swallows exceptions.
 
     rotate_base_before_shutdown=True translates the base back SHUTDOWN_REVERSE_CM
-    then rotates it SHUTDOWN_ROTATION_DEG in place first -- pass this whenever
-    the robot may be sitting close to a table with its arms about to fold in,
-    so they don't fold into it."""
+    then rotates it SHUTDOWN_ROTATION_DEG in place first, via rotate_base_once
+    (so it never double-fires against a concurrent wind-down rotation) -- pass
+    this whenever the robot may be sitting close to a table with its arms
+    about to fold in, so they don't fold into it."""
     if mobile_base is not None:
         try:
             mobile_base.set_goal_speed(vx=0, vy=0, vtheta=0)
@@ -160,13 +182,8 @@ def safe_robot_shutdown(reachy: ReachySDK, mobile_base=None, rotate_base_before_
         except Exception:
             pass
 
-    if rotate_base_before_shutdown and mobile_base is not None:
-        try:
-            mobile_base.turn_on()
-            mobile_base.translate_by(x=-SHUTDOWN_REVERSE_CM / 100.0, y=0.0, wait=True)
-            mobile_base.rotate_by(SHUTDOWN_ROTATION_DEG, wait=True)
-        except Exception:
-            pass
+    if rotate_base_before_shutdown:
+        rotate_base_once(mobile_base)
 
     try:
         reachy.turn_off_smoothly()

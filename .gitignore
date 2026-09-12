@@ -11,3 +11,4 @@ reachy_bomi/tests/depth_camera.py
 reachy_bomi/tests/elbow_135.py
 reachy_bomi/tests/3_Reachy_the_greengrocer.ipynb
 reachy_bomi/tests/param.py
+*.png
