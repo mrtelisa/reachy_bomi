@@ -481,7 +481,7 @@ def calibration_phase(cap, landmarker) -> list:
             print("Aborted.")
             sys.exit(0)
 
-    cv2.destroyWindow(window_name)
+    safety.destroy_window(window_name)
     return samples
 
 def cursor_preview_phase(cap, landmarker, bomi_map: BoMIMap, cursor_filter: CursorFilter = None,

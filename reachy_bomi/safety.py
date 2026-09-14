@@ -96,6 +96,20 @@ def raise_window(window_name: str) -> None:
             _wmctrl_missing_warned = True
 
 
+def destroy_window(window_name: str) -> None:
+    """cv2.destroyWindow, tolerant of the window already being gone. On this
+    Qt backend, destroying an already-destroyed (or never-created) window
+    doesn't no-op -- it raises cv2.error ("NULL guiReceiver"), which used to
+    crash callers that destroy the same window from more than one code path
+    (e.g. once right before execute_grasp, then again in a cleanup path after
+    execute_grasp fails). Use this everywhere instead of cv2.destroyWindow
+    directly."""
+    try:
+        cv2.destroyWindow(window_name)
+    except cv2.error:
+        pass
+
+
 def quit_requested(key: int, window_name: str) -> bool:
     """True if Q/ESC was pressed, or the window was closed with the X button."""
     if key in (ord('q'), ord('Q'), 27):

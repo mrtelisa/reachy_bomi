@@ -309,6 +309,57 @@ def _depth_crop_to_point_cloud(
     return world_coords[:, :3]
 
 
+def estimate_world_points_for_frame(
+    depth_cam: DepthCamera, depth_frame: np.ndarray, stride: int = 1, correct_distortion: bool = False,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Vectorized pixel_to_world over every stride-th pixel of the whole
+    depth_frame that has valid depth -- same backprojection math as
+    _depth_crop_to_point_cloud (duplicated rather than shared, since that
+    one's box-cropping indexing doesn't compose cleanly with a stride), just
+    generalized to the full frame with a stride for speed. Used by
+    reachy_selection.py to build a table-plane placement grid without a
+    per-pixel Python loop; correct_distortion defaults to False since that's
+    only a display aid there, not a value that drives the robot.
+
+    Returns (rows, cols, points): full-frame pixel row/col arrays (each the
+    top-left corner of its stride x stride block) and their corresponding
+    Reachy-world XYZ points, one row per valid sampled pixel."""
+    sampled = depth_frame[::stride, ::stride]
+    local_rows, local_cols = np.nonzero(sampled > 0)
+    if local_rows.size == 0:
+        return np.empty(0, dtype=int), np.empty(0, dtype=int), np.empty((0, 3))
+    rows = local_rows * stride
+    cols = local_cols * stride
+
+    params = depth_cam.get_parameters(view=CameraView.LEFT)
+    extrinsics = depth_cam.get_extrinsics(view=CameraView.LEFT)
+    if params is None or extrinsics is None:
+        return np.empty(0, dtype=int), np.empty(0, dtype=int), np.empty((0, 3))
+    _, _, _, D, K, _, _ = params
+
+    u = cols.astype(np.float64)
+    v = rows.astype(np.float64)
+    z_c = sampled[local_rows, local_cols].astype(np.float64) / 1000.0
+
+    if correct_distortion:
+        uv_points = np.stack([u, v], axis=1).reshape(-1, 1, 2)
+        undistort_criteria = (cv2.TERM_CRITERIA_MAX_ITER + cv2.TERM_CRITERIA_EPS, 100, 1e-6)
+        undistorted = cv2.undistortPointsIter(
+            uv_points, K, D, np.eye(3), np.eye(3), undistort_criteria
+        ).reshape(-1, 2)
+    else:
+        fx, cx = K[0, 0], K[0, 2]
+        fy, cy = K[1, 1], K[1, 2]
+        undistorted = np.stack([(u - cx) / fx, (v - cy) / fy], axis=1)
+    camera_coords = np.hstack([undistorted, np.ones((undistorted.shape[0], 1))])
+
+    camera_coords_homogeneous = np.stack(
+        [camera_coords[:, 0] * z_c, camera_coords[:, 1] * z_c, z_c, np.ones_like(z_c)], axis=1,
+    )
+    world_coords = camera_coords_homogeneous @ invert_affine_transformation_matrix(extrinsics).T
+    return rows, cols, world_coords[:, :3]
+
+
 def _remove_flying_pixels(
     point_cloud: np.ndarray, nb_points: int = FLYING_PIXEL_NEIGHBORS, radius: float = FLYING_PIXEL_RADIUS_M,
 ) -> np.ndarray:

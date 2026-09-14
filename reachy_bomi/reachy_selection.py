@@ -39,23 +39,30 @@ REPOSITIONING_HOVER_SECONDS = DWELL_HOLD_SECONDS
 # Sentinel class_name for "user dwelled on Repositioning" - handled by reachy_control.py
 REPOSITION_REQUESTED = object()
 
-# --- Free-point placement dwell (e.g. "put it in the box") ---
+# --- Free-point placement dwell, on a fixed reachability grid laid out on the
+# table plane itself (e.g. "put it in the box") ---
 PLACE_HOVER_SECONDS = DWELL_HOLD_SECONDS
 
-# Radius (px) of the tolerance circle the cursor must stay inside to keep
-# dwelling on a placement point. Big enough to absorb the hand tremor the
-# BoMI cursor carries through even after cursor_filter's smoothing (nobody can
-# hold a hand-tracked cursor to an exact pixel for 3s); small enough that the
-# confirmed point still reads as "here", not "somewhere over there".
-PLACE_TARGET_RADIUS_PX = 40
+# Real-world side length (m) of each grid cell, laid out on the table plane
+# (not the screen) -- two cells look the same physical size to the robot
+# whether they're near or far in the shot, unlike a screen-space grid where a
+# far cell covers far more real table than a near one. Big enough to dwell on
+# despite BoMI cursor tremor (comparable to a small YOLO detection box in
+# screen terms, at a typical distance); small enough that the placement still
+# lands close to where the user pointed. Tune this first if cells feel too
+# coarse or too fiddly on the real robot.
+PLACE_GRID_CELL_SIZE_M = 0.05
 
-# EMA weight applied to the anchor each frame the cursor stays inside the
-# tolerance circle, so it drifts along with a slow, unintentional hand
-# movement instead of comparing forever against the very first sample (which
-# would spuriously reset the dwell for a tremor that wanders gradually).
-PLACE_ANCHOR_SMOOTHING = 0.15
+# Every PLACE_GRID_SAMPLE_STRIDE_PXth pixel (in each axis) is classified into
+# a table-plane cell, instead of every pixel -- table cells are big enough
+# (PLACE_GRID_CELL_SIZE_M) relative to any reasonable camera resolution that
+# this loses no visible detail, while cutting the one-time setup cost
+# (dominated by reachy_detection.estimate_world_points_for_frame) by
+# stride**2.
+PLACE_GRID_SAMPLE_STRIDE_PX = 10
 
-COLOR_PLACE_TARGET = (0, 255, 255)
+COLOR_UNREACHABLE = (0, 0, 200)   # BGR red, translucent fill over unreachable/unknown table area
+UNREACHABLE_TINT_ALPHA = 0.35
 
 CONFIRM_WINDOW_NAME = "BoMI - Confirm Grasp"
 CONFIRM_CANVAS_WIDTH = 520
@@ -116,17 +123,55 @@ def _draw_bomi_cursor(frame: np.ndarray, x: int, y: int) -> None:
     cv2.drawMarker(frame, (x, y), COLOR_CURSOR, markerType=cv2.MARKER_CROSS, markerSize=20, thickness=2)
 
 
-def _draw_place_target(frame: np.ndarray, anchor_x: int, anchor_y: int, progress: float) -> None:
-    """Tolerance circle for select_place_location_bomi: an outline the user
-    dwells inside, filled clockwise as a pie to show progress -- same
-    affordance as the hover progress bars, just circular since there's no
-    YOLO box to draw it against."""
-    cv2.circle(frame, (anchor_x, anchor_y), PLACE_TARGET_RADIUS_PX, COLOR_PLACE_TARGET, 2)
-    if progress > 0:
-        cv2.ellipse(
-            frame, (anchor_x, anchor_y), (PLACE_TARGET_RADIUS_PX, PLACE_TARGET_RADIUS_PX),
-            -90, 0, 360 * progress, COLOR_PLACE_TARGET, -1,
-        )
+def _table_plane_basis(table_normal: np.ndarray) -> tuple:
+    """Orthonormal in-plane basis perpendicular to table_normal: basis_u is
+    Reachy world X ("forward", per reachy_grasp.py's frame convention)
+    projected onto the plane, basis_v completes a right-handed frame with
+    normal. Falls back to world Y as the reference if the table is (bizarrely)
+    near-vertical relative to X. Returns (normal, basis_u, basis_v), all unit
+    vectors."""
+    normal = table_normal / np.linalg.norm(table_normal)
+    reference = np.array([1.0, 0.0, 0.0])
+    if abs(np.dot(reference, normal)) > 0.9:
+        reference = np.array([0.0, 1.0, 0.0])
+    basis_u = reference - normal * np.dot(reference, normal)
+    basis_u /= np.linalg.norm(basis_u)
+    basis_v = np.cross(normal, basis_u)
+    return normal, basis_u, basis_v
+
+
+def _draw_place_grid(
+    frame: np.ndarray, unreachable_mask: np.ndarray,
+    coarse_row_img: np.ndarray, coarse_col_img: np.ndarray, stride: int,
+    hovered_cell: Optional[tuple], hover_progress: float, hovered_reachable: bool,
+) -> None:
+    """Tints unreachable/unknown table area red (translucent) -- unreachable_mask
+    is full-resolution and precomputed once in _build_place_grid, since it
+    doesn't change during the dwell. Then outlines hovered_cell's actual
+    projected shape, found via cv2.findContours on the coarse table-plane
+    classification image (so it follows the table's real perspective --
+    smaller/more skewed the farther away it is -- instead of being a flat
+    screen rectangle): yellow and filled with dwell progress if reachable,
+    red (no fill) otherwise, so hovering unreachable table area still gives
+    feedback without ever accumulating progress there."""
+    red = np.full_like(frame, COLOR_UNREACHABLE)
+    blended = cv2.addWeighted(red, UNREACHABLE_TINT_ALPHA, frame, 1 - UNREACHABLE_TINT_ALPHA, 0)
+    frame[unreachable_mask] = blended[unreachable_mask]
+
+    if hovered_cell is None:
+        return
+    row, col = hovered_cell
+    mask = ((coarse_row_img == row) & (coarse_col_img == col)).astype(np.uint8)
+    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not contours:
+        return
+    contour = max(contours, key=cv2.contourArea) * stride
+    color = COLOR_YELLOW if hovered_reachable else COLOR_UNREACHABLE
+    cv2.drawContours(frame, [contour], -1, color, 3)
+    if hovered_reachable and hover_progress > 0:
+        x, y, w, h = cv2.boundingRect(contour)
+        bar_width = int(w * hover_progress)
+        cv2.rectangle(frame, (x, y + h - 6), (x + bar_width, y + h), color, -1)
 
 
 # --- Hover geometry ---
@@ -245,78 +290,163 @@ def select_object_to_grasp_bomi(
             return None, None, (base_frame, detections, labels), crs_x, crs_y
 
 
-def select_place_location_bomi(cap, landmarker, bomi_map, cursor_filter, crs_x, crs_y, depth_cam):
-    """Dwell-to-pick-a-point loop for placing an already-grasped object (e.g.
-    "put it in the box"): unlike select_object_to_grasp_bomi, the target
-    isn't a YOLO box, so the tolerance region is a fixed-radius circle
-    (_draw_place_target) that recenters itself on the cursor (PLACE_ANCHOR_SMOOTHING)
-    while the cursor stays inside it, and resets on a bigger, intentional move.
+def _build_place_grid(depth_cam, depth_frame, frame_w, frame_h, reachy, plan, geometry):
+    """Classifies (a stride-sampled subset of) the frame's pixels by which
+    PLACE_GRID_CELL_SIZE_M cell of the table plane they land in -- a grid
+    laid out in real-world meters on the table itself, not on the screen, so
+    it looks like it's actually resting on the table (perspective-correct:
+    smaller/more skewed toward the horizon) instead of a flat rectangular
+    overlay. The table plane's origin is geometry.centroid (near where the
+    object was picked up) if available, else world origin -- either way just
+    a fixed reference for cell indexing, since only the components
+    perpendicular to table_normal (basis_u/basis_v) affect it.
 
-    Confirmed by dwelling inside that circle for PLACE_HOVER_SECONDS. The
-    returned point is the median of every valid depth reading taken at the
-    anchor while dwelling, for the same per-pixel noise robustness
-    reachy_detection.build_object_point_cloud gets from fusing several depth
-    frames.
+    For each cell that appears in the frame, computes its real-world center
+    and the place GraspPlan reachy_grasp.plan_place derives from it (which
+    IK-checks it for plan.arm_name) -- used only to color the grid; the
+    caller re-derives the actual place plan fresh right before moving (see
+    select_place_location_bomi), to minimize how many reachy.inverse_kinematics
+    calls happen between validating it and acting on it -- reachy2_sdk's IK
+    solver appears to seed its search from the last computed solution, so the
+    many speculative IK checks this grid needs (one plan_place call per
+    cell, easily 100+) can otherwise leave it unable to re-solve a pose it
+    validated only moments earlier.
+
+    Returns (stride, coarse_row_img, coarse_col_img, cell_targets, cell_plans,
+    unreachable_mask):
+      - coarse_row_img/coarse_col_img: int32 arrays, shape
+        (ceil(frame_h/stride), ceil(frame_w/stride)) -- each entry is the
+        table-plane cell (row, col) the corresponding stride x stride screen
+        block landed in, or -1 where there was no valid depth.
+      - cell_targets: {(row, col): xyz point} for every cell that appeared.
+      - cell_plans: {(row, col): GraspPlan or None} for the same cells.
+      - unreachable_mask: full-resolution (frame_h, frame_w) bool array,
+        True wherever the table area is unknown (no depth) or unreachable --
+        precomputed once here since it doesn't change during the dwell."""
+    stride = PLACE_GRID_SAMPLE_STRIDE_PX
+    table_normal = geometry.table_normal if geometry.table_normal is not None else reachy_grasp.DEFAULT_TABLE_NORMAL
+    _, basis_u, basis_v = _table_plane_basis(table_normal)
+    origin = geometry.centroid if geometry.centroid is not None else np.zeros(3)
+
+    rows, cols, points = reachy_detection.estimate_world_points_for_frame(depth_cam, depth_frame, stride=stride)
+
+    coarse_h, coarse_w = math.ceil(frame_h / stride), math.ceil(frame_w / stride)
+    coarse_row_img = np.full((coarse_h, coarse_w), -1, dtype=np.int32)
+    coarse_col_img = np.full((coarse_h, coarse_w), -1, dtype=np.int32)
+    cell_targets: dict = {}
+    cell_plans: dict = {}
+    unreachable_mask = np.ones((frame_h, frame_w), dtype=bool)  # default: no data at all -> unknown/unreachable
+
+    if points.shape[0] > 0:
+        rel = points - origin
+        cell_col = np.floor((rel @ basis_u) / PLACE_GRID_CELL_SIZE_M).astype(np.int32)
+        cell_row = np.floor((rel @ basis_v) / PLACE_GRID_CELL_SIZE_M).astype(np.int32)
+        coarse_row_img[rows // stride, cols // stride] = cell_row
+        coarse_col_img[rows // stride, cols // stride] = cell_col
+
+        for rr, cc in np.unique(np.stack([cell_row, cell_col], axis=1), axis=0):
+            rr, cc = int(rr), int(cc)
+            center = origin + (cc + 0.5) * PLACE_GRID_CELL_SIZE_M * basis_u + (rr + 0.5) * PLACE_GRID_CELL_SIZE_M * basis_v
+            cell_targets[(rr, cc)] = center
+            cell_plans[(rr, cc)] = reachy_grasp.plan_place(reachy, plan, geometry.table_normal, center)
+
+        coarse_unreachable = coarse_row_img == -1
+        valid = ~coarse_unreachable
+        if np.any(valid):
+            reachable_flags = np.fromiter(
+                (cell_plans[(int(r), int(c))] is not None
+                 for r, c in zip(coarse_row_img[valid], coarse_col_img[valid])),
+                dtype=bool, count=int(np.count_nonzero(valid)),
+            )
+            coarse_unreachable[valid] = ~reachable_flags
+        unreachable_mask = cv2.resize(
+            coarse_unreachable.astype(np.uint8), (frame_w, frame_h), interpolation=cv2.INTER_NEAREST,
+        ).astype(bool)
+
+    return stride, coarse_row_img, coarse_col_img, cell_targets, cell_plans, unreachable_mask
+
+
+def select_place_location_bomi(cap, landmarker, bomi_map, cursor_filter, crs_x, crs_y, depth_cam, reachy, plan, geometry):
+    """Dwell-to-pick-a-cell loop for placing an already-grasped object (e.g.
+    "put it in the box"), the cells laid out on the table plane itself
+    (_build_place_grid) rather than the screen. Captures a single torso
+    RGB+depth frame up front -- same as select_object_to_grasp_bomi does for
+    its YOLO detections -- then builds the grid and precomputes each cell's
+    reachability once. Unlike a free-floating anchor, dwelling is then just
+    "is the cursor still over the same table cell as last frame" -- cells
+    don't move, so cursor tremor within one never resets the dwell, only
+    actually crossing into a different cell does.
+
+    Unreachable/unknown table area is tinted red and never accumulates dwell
+    progress (hovering it behaves like hovering nothing), which steers the
+    user away from it without a separate error dialog.
+
+    Confirmed by dwelling on the same reachable cell for PLACE_HOVER_SECONDS.
+    Returns that cell's raw 3D target point, not the GraspPlan _build_place_grid
+    computed for it -- the caller should re-derive the actual place plan (and
+    ideally re-run plan_grasp too) right before moving, per _build_place_grid's
+    docstring.
 
     Returns (target point [xyz, m, Reachy world frame] or None if the user
-    quit, crs_x, crs_y)."""
-    anchor = None
-    hover_start = None
-    position_samples: List[np.ndarray] = []
+    quit, the initial capture failed, or there's no depth frame to build a
+    grid from, crs_x, crs_y)."""
+    capture = reachy_detection.capture_rgb_and_depth(depth_cam)
+    if capture is None:
+        print("[place] could not capture a frame from the depth camera")
+        return None, crs_x, crs_y
+    base_frame, depth_frame = capture
+    frame_h, frame_w = base_frame.shape[:2]
+    if depth_frame is None:
+        print("[place] no depth frame available -- can't compute a placement grid")
+        return None, crs_x, crs_y
 
-    print(f"\n=== PLACE LOCATION ===  Q = quit  |  hold the cursor inside the "
-          f"circle for {PLACE_HOVER_SECONDS:.0f}s to confirm where to place it")
+    wait_frame = base_frame.copy()
+    cv2.putText(wait_frame, "Computing reachable area...", (30, 40),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.9, COLOR_BUTTON_TEXT, 2)
+    cv2.imshow(reachy_detection.CAM_WINDOW_NAME, wait_frame)
+    cv2.waitKey(1)
+    stride, coarse_row_img, coarse_col_img, cell_targets, cell_plans, unreachable_mask = _build_place_grid(
+        depth_cam, depth_frame, frame_w, frame_h, reachy, plan, geometry,
+    )
+    coarse_h, coarse_w = coarse_row_img.shape
+
+    tracked_cell = None  # the reachable cell currently accumulating dwell, or None
+    hover_start = None
+
+    print(f"\n=== PLACE LOCATION ===  Q = quit  |  hold the cursor over a spot on the "
+          f"table for {PLACE_HOVER_SECONDS:.0f}s to confirm where to place it (red area isn't reachable)")
 
     while True:
         _, crs_x, crs_y, _ = bomi_teleop.update_bomi_cursor(cap, landmarker, bomi_map, cursor_filter, crs_x, crs_y)
 
-        capture = reachy_detection.capture_rgb_and_depth(depth_cam)
-        if capture is None:
-            key = cv2.waitKey(1) & 0xFF
-            if safety.quit_requested(key, reachy_detection.CAM_WINDOW_NAME):
-                return None, crs_x, crs_y
-            continue
-        base_frame, depth_frame = capture
-        frame_h, frame_w = base_frame.shape[:2]
-
         gx, gy = bomi_teleop.map_bomi_to_frame(crs_x, crs_y, frame_w, frame_h)
+        coarse_y = min(max(gy // stride, 0), coarse_h - 1)
+        coarse_x = min(max(gx // stride, 0), coarse_w - 1)
+        rr, cc = int(coarse_row_img[coarse_y, coarse_x]), int(coarse_col_img[coarse_y, coarse_x])
+        current_cell = (rr, cc) if rr != -1 else None
         now = time.time()
 
-        if anchor is None:
-            anchor = (gx, gy)
-            hover_start = now
-            position_samples = []
-        elif math.hypot(gx - anchor[0], gy - anchor[1]) > PLACE_TARGET_RADIUS_PX:
-            anchor = (gx, gy)
-            hover_start = now
-            position_samples = []
-        else:
-            anchor = (
-                anchor[0] + PLACE_ANCHOR_SMOOTHING * (gx - anchor[0]),
-                anchor[1] + PLACE_ANCHOR_SMOOTHING * (gy - anchor[1]),
-            )
+        place_plan = cell_plans.get(current_cell) if current_cell is not None else None
+        if place_plan is None:
+            tracked_cell, hover_start = None, None
+        elif tracked_cell != current_cell:
+            tracked_cell, hover_start = current_cell, now
+        hover_progress = (
+            min((now - hover_start) / PLACE_HOVER_SECONDS, 1.0) if tracked_cell is not None else 0.0
+        )
 
-        if depth_frame is not None:
-            position = reachy_detection.estimate_position_at_pixel(
-                depth_cam, depth_frame, int(anchor[0]), int(anchor[1]),
-            )
-            if position is not None:
-                position_samples.append(position)
-
-        hover_progress = min((now - hover_start) / PLACE_HOVER_SECONDS, 1.0)
         if hover_progress >= 1.0:
-            if position_samples:
-                return np.median(np.stack(position_samples), axis=0), crs_x, crs_y
-            # Dwelled long enough but never got a valid depth reading at the
-            # anchor (e.g. hovering off the table/box edge) -- keep trying
-            # instead of returning a made-up point.
-            print("[place] no valid depth at that point -- keep dwelling somewhere else")
-            anchor, hover_start, position_samples = None, None, []
+            return cell_targets[current_cell], crs_x, crs_y
 
         frame = base_frame.copy()
-        _draw_place_target(frame, int(anchor[0]), int(anchor[1]), hover_progress)
+        _draw_place_grid(
+            frame, unreachable_mask, coarse_row_img, coarse_col_img, stride,
+            current_cell, hover_progress, place_plan is not None,
+        )
         _draw_bomi_cursor(frame, gx, gy)
         cv2.imshow(reachy_detection.CAM_WINDOW_NAME, frame)
+        cv2.setWindowProperty(reachy_detection.CAM_WINDOW_NAME, cv2.WND_PROP_TOPMOST, 1)  # re-pin (same-process windows only)
+        safety.raise_window(reachy_detection.CAM_WINDOW_NAME)  # wins over a cross-process fullscreen window too
 
         key = cv2.waitKey(1) & 0xFF
         if safety.quit_requested(key, reachy_detection.CAM_WINDOW_NAME):
@@ -360,7 +490,7 @@ def confirm_bomi(cap, landmarker, bomi_map, cursor_filter, crs_x, crs_y, lines: 
             result = False
 
         if quit_now or result is not None:
-            cv2.destroyWindow(CONFIRM_WINDOW_NAME)
+            safety.destroy_window(CONFIRM_WINDOW_NAME)
             return (None if quit_now else result), crs_x, crs_y
 
 
@@ -378,6 +508,16 @@ def confirm_place_bomi(cap, landmarker, bomi_map, cursor_filter, crs_x, crs_y):
     return confirm_bomi(
         cap, landmarker, bomi_map, cursor_filter, crs_x, crs_y,
         lines=["You have selected where to place the object.", "Do you want to confirm?"],
+    )
+
+
+def confirm_new_object_bomi(cap, landmarker, bomi_map, cursor_filter, crs_x, crs_y):
+    """Yes/No dwell dialog asked right after a successful placement: Yes loops
+    back into object selection on a fresh capture, No (or quitting) starts the
+    end-of-session wind-down (back up, rotate, power off)."""
+    return confirm_bomi(
+        cap, landmarker, bomi_map, cursor_filter, crs_x, crs_y,
+        lines=["Object placed.", "Do you want to select a new object?"],
     )
 
 

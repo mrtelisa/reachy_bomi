@@ -75,9 +75,9 @@ def wait_for_pre_grasp_pose(cap, landmarker, bomi_map, cursor_filter, crs_x, crs
 
         key = cv2.waitKey(1) & 0xFF
         if safety.quit_requested(key, WAIT_WINDOW_NAME):
-            cv2.destroyWindow(WAIT_WINDOW_NAME)
+            safety.destroy_window(WAIT_WINDOW_NAME)
             return crs_x, crs_y, True
 
         if all(reachy.is_goto_finished(goto_id) for goto_id in goto_ids):
-            cv2.destroyWindow(WAIT_WINDOW_NAME)
+            safety.destroy_window(WAIT_WINDOW_NAME)
             return crs_x, crs_y, False
