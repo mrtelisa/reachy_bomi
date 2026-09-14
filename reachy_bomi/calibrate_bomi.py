@@ -97,7 +97,7 @@ def main() -> None:
         samples = bomi_teleop.calibration_phase(cap, landmarker)
         bomi_map = bomi_teleop.BoMIMap()
         bomi_map.fit(samples)
-        print("PCA map fitted")
+        print("Autoencoder map fitted")
 
         _preview_and_save(cap, landmarker, bomi_map)
     finally:
