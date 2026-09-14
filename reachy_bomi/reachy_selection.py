@@ -51,7 +51,7 @@ PLACE_HOVER_SECONDS = DWELL_HOLD_SECONDS
 # screen terms, at a typical distance); small enough that the placement still
 # lands close to where the user pointed. Tune this first if cells feel too
 # coarse or too fiddly on the real robot.
-PLACE_GRID_CELL_SIZE_M = 0.05
+PLACE_GRID_CELL_SIZE_M = 0.07
 
 # Every PLACE_GRID_SAMPLE_STRIDE_PXth pixel (in each axis) is classified into
 # a table-plane cell, instead of every pixel -- table cells are big enough
@@ -60,6 +60,12 @@ PLACE_GRID_CELL_SIZE_M = 0.05
 # (dominated by reachy_detection.estimate_world_points_for_frame) by
 # stride**2.
 PLACE_GRID_SAMPLE_STRIDE_PX = 10
+
+# How many approach directions plan_place tries per cell while building the
+# grid -- fewer than its default, since it runs once per cell (hundreds of
+# times) rather than once. Lower this first if "Computing reachable area..."
+# starts taking too long; raise it if too much of the table reads as red.
+PLACE_GRID_CANDIDATE_COUNT = reachy_grasp.QUICK_REACHABILITY_CANDIDATE_COUNT
 
 COLOR_UNREACHABLE = (0, 0, 200)   # BGR red, translucent fill over unreachable/unknown table area
 UNREACHABLE_TINT_ALPHA = 0.35
@@ -348,7 +354,9 @@ def _build_place_grid(depth_cam, depth_frame, frame_w, frame_h, reachy, plan, ge
             rr, cc = int(rr), int(cc)
             center = origin + (cc + 0.5) * PLACE_GRID_CELL_SIZE_M * basis_u + (rr + 0.5) * PLACE_GRID_CELL_SIZE_M * basis_v
             cell_targets[(rr, cc)] = center
-            cell_plans[(rr, cc)] = reachy_grasp.plan_place(reachy, plan, geometry.table_normal, center)
+            cell_plans[(rr, cc)] = reachy_grasp.plan_place(
+                reachy, plan, geometry.table_normal, center, candidate_count=PLACE_GRID_CANDIDATE_COUNT,
+            )
 
         coarse_unreachable = coarse_row_img == -1
         valid = ~coarse_unreachable

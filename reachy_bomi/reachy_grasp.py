@@ -23,9 +23,9 @@ GRIPPER_MAX_OPENING_M = 0.1 # [m], parallel gripper's max fingertip opening
 PREGRASP_STANDOFF_M = 0.10
 
 # How far straight up the arm lifts once the gripper has closed 
-GRASP_LIFT_M = 0.20
+GRASP_LIFT_M = 0.10
 
-ARM_GOTO_DURATION_S = 5.0 #[s]
+ARM_GOTO_DURATION_S = 3.0 
 
 # How far outside the object's near surface (beyond its radius) the
 # commanded EE position sits, per arm -- the left arm has been observed to
@@ -268,6 +268,7 @@ def plan_grasp(reachy: ReachySDK, geometry: ObjectGeometry) -> Optional[GraspPla
 def plan_place(
     reachy: ReachySDK, plan: GraspPlan,
     table_normal: Optional[npt.NDArray[np.float64]], target_point: npt.NDArray[np.float64],
+    candidate_count: int = APPROACH_CANDIDATE_COUNT,
 ) -> Optional[GraspPlan]:
     """Place GraspPlan for the object plan already grasped: released at the
     same height it was grasped from (plan.grasp_matrix's height along
@@ -279,11 +280,20 @@ def plan_place(
     perpendicular to table_normal is by definition horizontal, so wherever
     target_point sits along table_normal doesn't matter for a level table.
 
-    Keeps plan's arm and orientation unchanged (the gripper doesn't need to
-    reorient to place what it's already holding). Returns three waypoints,
-    reusing GraspPlan's fields:
+    Searches orientations the way plan_grasp does, rather than inheriting
+    the grasp's: the orientation the object is currently held in is tried
+    first (so a wrist that doesn't need to move doesn't move), then
+    `candidate_count` horizontal approaches around the circle. Every
+    candidate keeps the gripper's local X up (_side_grasp_closing_axis), so
+    switching between them only yaws the held object about its own vertical
+    axis, never tips it -- and the retreat follows whichever orientation
+    won, so it always withdraws along the gripper's own axis, clear of the
+    object's sides.
+
+    Returns three waypoints, reusing GraspPlan's fields:
       - lift_matrix: "transit" -- above target_point's horizontal position,
-        at plan.lift_matrix's height (a level carry after the lift).
+        at plan.lift_matrix's height, so the carry ends at the same height
+        the lift ended at.
       - grasp_matrix: "place" -- same horizontal position, dropped back down
         by the same distance plan.lift_matrix climbed above plan.grasp_matrix
         (where the gripper opens), plus PLACE_HEIGHT_MARGIN_M -- releasing
@@ -291,14 +301,15 @@ def plan_place(
         lower than intended (slip in the gripper during transit and/or arm
         sag under the object's weight).
       - pregrasp_matrix: "retreat" -- PREGRASP_STANDOFF_M back out from
-        there once the gripper has opened, along -rotation[:,2] (the
-        gripper's own forward axis, unchanged from the grasp) rather than
-        straight up along table_normal or any direction picked independently
-        of orientation -- since orientation stays fixed, that's the only
-        direction guaranteed clear of the object's sides for the still-open
-        fingers to withdraw along without dragging/knocking it.
-    Returns None if any of the three is unreachable for plan.arm_name, so
-    the caller can ask the user to dwell on a different point instead."""
+        there once the gripper has opened, along the winning orientation's
+        own forward axis rather than up along table_normal or any direction
+        picked independently of orientation: that's the only direction
+        guaranteed clear of the object's sides for the still-open fingers to
+        withdraw along without dragging/knocking it.
+
+    Returns None (silently -- _build_place_grid calls this once per grid
+    cell) if no orientation puts all three poses within reach of
+    plan.arm_name, so the caller can ask the user for a different point."""
     arm = getattr(reachy, plan.arm_name, None)
     if arm is None:
         return None
@@ -306,41 +317,40 @@ def plan_place(
     normal = table_normal if table_normal is not None else DEFAULT_TABLE_NORMAL
     normal = normal / np.linalg.norm(normal)
 
-    rotation = plan.grasp_matrix[:3, :3]
-    # Retreat direction: the gripper's own forward axis (-rotation[:,2], the
-    # inverse of _orientation_from_approach's local_z = -approach/||approach||),
-    # NOT a direction picked independently of orientation (e.g. "toward the
-    # robot"). Orientation stays fixed from the original grasp, so the
-    # gripper (open, but still positioned as if wrapped around the object
-    # from that approach) is only guaranteed clear to withdraw straight back
-    # along that same axis -- any other direction can drag/knock the object
-    # sideways with the still-nearby fingers.
-    approach = -rotation[:, 2]
     target_inplane = target_point - normal * np.dot(target_point, normal)
-
     lift_height = np.dot(plan.lift_matrix[:3, 3], normal)
     grasp_height = np.dot(plan.grasp_matrix[:3, 3], normal) + PLACE_HEIGHT_MARGIN_M
 
     transit_position = target_inplane + normal * lift_height
     place_position = target_inplane + normal * grasp_height
-    pregrasp_position = place_position - approach * PREGRASP_STANDOFF_M
 
-    transit_matrix = _pose_matrix(rotation, transit_position)
-    place_matrix = _pose_matrix(rotation, place_position)
-    pregrasp_matrix = _pose_matrix(rotation, pregrasp_position)
-    for name, matrix in (("transit", transit_matrix), ("place", place_matrix), ("retreat", pregrasp_matrix)):
+    # -grasp_matrix's local z is the approach it was built from
+    # (_orientation_from_approach), so this re-derives the current orientation
+    # as candidate #0 rather than special-casing it.
+    held_approach = -plan.grasp_matrix[:3, 2]
+    for approach in [held_approach] + _approach_candidates(place_position, normal, count=candidate_count):
+        rotation = _orientation_from_approach(approach, _side_grasp_closing_axis(approach, normal))
+        pregrasp_position = place_position - approach * PREGRASP_STANDOFF_M
+        # place first: a cell well outside the workspace fails it for every
+        # candidate, so it bails after one IK call each instead of three
+        place_matrix = _pose_matrix(rotation, place_position)
+        transit_matrix = _pose_matrix(rotation, transit_position)
+        pregrasp_matrix = _pose_matrix(rotation, pregrasp_position)
         try:
-            arm.inverse_kinematics(matrix)
+            arm.inverse_kinematics(place_matrix)
+            arm.inverse_kinematics(transit_matrix)
+            arm.inverse_kinematics(pregrasp_matrix)
         except ValueError:
-            print(f"[plan_place] {name} pose unreachable for {plan.arm_name}")
-            return None
+            continue
 
-    return GraspPlan(
-        arm_name=plan.arm_name,
-        pregrasp_matrix=pregrasp_matrix,  # retreat, after the gripper opens
-        grasp_matrix=place_matrix,        # where the gripper opens
-        lift_matrix=transit_matrix,       # constant-height transit waypoint before descending
-    )
+        return GraspPlan(
+            arm_name=plan.arm_name,
+            pregrasp_matrix=pregrasp_matrix,  # retreat, after the gripper opens
+            grasp_matrix=place_matrix,        # where the gripper opens
+            lift_matrix=transit_matrix,       # constant-height transit waypoint before descending
+        )
+
+    return None
 
 
 def _look_at_matrix(reachy: ReachySDK, matrix: npt.NDArray[np.float64], duration: float) -> None:
@@ -425,18 +435,22 @@ def place_back(reachy: ReachySDK, plan: GraspPlan, duration: float = ARM_GOTO_DU
 def execute_place(reachy: ReachySDK, place_plan: GraspPlan, duration: float = ARM_GOTO_DURATION_S) -> bool:
     """Drives place_plan.arm_name -- already holding the object after
     execute_grasp -- from wherever it currently is (the lift pose, near the
-    original pickup spot) through: straight over to the target's XY at the
-    same height it was lifted to (place_plan.lift_matrix, plan_place's
-    "transit" waypoint -- a horizontal carry, not a diagonal descent),
-    straight down to the target, dropping by the same distance the lift
-    climbed (place_plan.grasp_matrix), open the gripper, straight back out
-    PREGRASP_STANDOFF_M along the gripper's own forward axis
+    original pickup spot) through: over to the target's XY at the same
+    height it was lifted to (place_plan.lift_matrix, plan_place's "transit"
+    waypoint), straight down to the target, dropping by the same distance
+    the lift climbed (place_plan.grasp_matrix), open the gripper, straight
+    back out PREGRASP_STANDOFF_M along the gripper's own forward axis
     (place_plan.pregrasp_matrix -- withdrawing along the same line it
     approached on, clear of the object's sides, not lifting away over it or
-    pulling off at some other angle that could drag/knock it). Every leg
-    uses cartesian-space interpolation, each a clean horizontal or vertical
-    line. The head tracks the
-    end-effector throughout.
+    pulling off at some other angle that could drag/knock it).
+
+    The transit leg interpolates in joint space, so the wrist is free to
+    rotate on the way (plan_place may pick a different orientation than the
+    object is currently held in) as long as it arrives at the chosen pose --
+    a straight cartesian line there can't always accommodate both the
+    translation and the reorientation. The two legs near the object, where
+    the path itself matters, stay cartesian: a clean vertical drop and a
+    clean straight withdrawal. The head tracks the end-effector throughout.
 
     Returns False without moving if the arm/gripper isn't available or any
     pose is unreachable from the arm's current joints; returns False
@@ -458,9 +472,9 @@ def execute_place(reachy: ReachySDK, place_plan: GraspPlan, duration: float = AR
             return False
 
     try:
-        print(f"[{place_plan.arm_name}] carrying to above the placement point (same height)...")
+        print(f"[{place_plan.arm_name}] carrying to above the placement point...")
         _look_at_matrix(reachy, place_plan.lift_matrix, duration)
-        arm.goto(place_plan.lift_matrix, duration=duration, interpolation_space="cartesian_space", wait=True)
+        arm.goto(place_plan.lift_matrix, duration=duration, wait=True)
         print(f"[{place_plan.arm_name}] lowering to place...")
         _look_at_matrix(reachy, place_plan.grasp_matrix, duration)
         arm.goto(place_plan.grasp_matrix, duration=duration, interpolation_space="cartesian_space", wait=True)
