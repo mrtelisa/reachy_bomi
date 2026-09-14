@@ -43,10 +43,13 @@ Phase 4 - Object selection / grasp (opened from Control):
     Capture -> hover-to-select -> Yes/No confirm, see reachy_selection.py
     (select_object_to_grasp_bomi/confirm_grasp_bomi), every hover point being
     the BoMI cursor. Answering "No" re-offers hover-select on the same capture.
-    Confirming "Yes" moves to _resolve_and_confirm_place_point: dwell-pick a
-    placement point on a fixed reachability grid (select_place_location_bomi,
-    e.g. inside a box -- unreachable cells are shown red and never accumulate
-    dwell), then a second Yes/No confirm (confirm_place_bomi) on the point
+    Confirming "Yes" plans the pick for BOTH arms (plan_grasps_by_arm) and
+    moves to _resolve_and_confirm_place_point: dwell-pick a placement point
+    on a fixed reachability grid (select_place_location_bomi, e.g. inside a
+    box), showing the union of what each arm that can pick this object up
+    could then do with it -- unreachable cells are shown red and never
+    accumulate dwell, and the confirmed cell is what decides which arm does
+    the job. Then a second Yes/No confirm (confirm_place_bomi) on the point
     itself -- "No" re-offers point selection, quitting at either step aborts
     the object (nothing has been grasped yet). Once both are confirmed,
     plan_grasp/plan_place are re-run fresh right before moving (the grid's
@@ -223,16 +226,19 @@ def _run_grasp_mode(cap, landmarker, bomi_map, cursor_filter, depth_cam, model, 
             print(f"[{class_name}] estimated width={geometry.width_m * 100:.1f}cm  "
                   f"height={geometry.height_m * 100:.1f}cm")
 
-            plan = reachy_grasp.plan_grasp(reachy, geometry)
-            if plan is None:
+            # Plan for BOTH arms, not just one: the placement grid shows the
+            # union of what each can do with this object, and the spot the
+            # user picks is what decides which arm actually does the job.
+            grasp_plans = reachy_grasp.plan_grasps_by_arm(reachy, geometry)
+            if not grasp_plans:
                 print(f"[{class_name}] no feasible grasp (too wide for the gripper, "
-                      "or its pose couldn't be estimated)")
+                      "out of reach, or its pose couldn't be estimated)")
                 break
 
-            #graphs.show_grasp_plan(geometry, plan)
-            target_point, crs_x, crs_y = _resolve_and_confirm_place_point(
+            #graphs.show_grasp_plan(geometry, next(iter(grasp_plans.values())))
+            target_point, place_arm, crs_x, crs_y = _resolve_and_confirm_place_point(
                 cap, landmarker, bomi_map, cursor_filter, crs_x, crs_y,
-                depth_cam, reachy, plan, geometry,
+                depth_cam, reachy, grasp_plans, geometry,
             )
             if target_point is None:
                 break  # user quit instead of confirming a placement point
@@ -245,10 +251,11 @@ def _run_grasp_mode(cap, landmarker, bomi_map, cursor_filter, depth_cam, model, 
             safety.destroy_window(reachy_detection.CAM_WINDOW_NAME)
             start_camera_viewer(robot_ip)
 
-            plan, place_plan = _replan_and_execute_grasp(reachy, geometry, target_point)
+            plan, place_plan = _replan_and_execute_grasp(reachy, geometry, target_point, place_arm)
             if plan is None:
                 _abort_and_shutdown(
-                    reachy, mobile_base, f"[{class_name}] couldn't execute a grasp after {MAX_GRASP_ATTEMPTS} attempts",
+                    reachy, mobile_base,
+                    f"[{class_name}] {place_arm} couldn't execute a grasp after {MAX_GRASP_ATTEMPTS} attempts",
                 )
                 break
             if not _place_object(reachy, place_plan):
@@ -376,38 +383,39 @@ def _run_grasp_mode(cap, landmarker, bomi_map, cursor_filter, depth_cam, model, 
 
 def _resolve_and_confirm_place_point(
     cap, landmarker, bomi_map, cursor_filter, crs_x, crs_y,
-    depth_cam, reachy, plan: reachy_grasp.GraspPlan, geometry: reachy_grasp.ObjectGeometry,
+    depth_cam, reachy, grasp_plans: dict, geometry: reachy_grasp.ObjectGeometry,
 ) -> tuple:
     """Dwell-selects a placement point on a fixed reachability grid
     (reachy_selection.select_place_location_bomi, which already IK-checks
-    every cell when it builds the grid -- unreachable cells are shown red
-    and can't be dwelled on, so there's no separate "not reachable" retry
-    needed here), then asks a Yes/No dwell confirm on the point itself
-    (reachy_selection.confirm_place_bomi) -- "No" re-offers point selection
-    (a fresh grid, in case anything moved). Runs entirely before
-    execute_grasp, so nothing has been physically grasped yet: quitting at
-    either step just aborts, nothing to place back.
+    every cell for every arm in grasp_plans when it builds the grid --
+    unreachable cells are shown red and can't be dwelled on, so there's no
+    separate "not reachable" retry needed here), then asks a Yes/No dwell
+    confirm on the point itself (reachy_selection.confirm_place_bomi) --
+    "No" re-offers point selection (a fresh grid, in case anything moved).
+    Runs entirely before execute_grasp, so nothing has been physically
+    grasped yet: quitting at either step just aborts, nothing to place back.
 
-    Returns the raw target point, not a ready GraspPlan: the caller should
-    re-run plan_grasp/plan_place right before moving (see
-    reachy_selection._build_place_grid's docstring for why -- the grid's own
-    IK checks can leave an earlier plan no longer solvable).
-    Returns (confirmed target point, crs_x, crs_y), or (None, crs_x, crs_y)
-    if the user quit instead of confirming a point."""
+    Returns the raw target point plus the arm that can serve it, not a ready
+    GraspPlan: the caller should re-run plan_grasp/plan_place for that arm
+    right before moving (see reachy_selection._build_place_grid's docstring
+    for why -- the grid's own IK checks can leave an earlier plan no longer
+    solvable).
+    Returns (confirmed target point, arm_name, crs_x, crs_y), or
+    (None, None, crs_x, crs_y) if the user quit instead of confirming."""
     while True:
-        target_point, crs_x, crs_y = reachy_selection.select_place_location_bomi(
-            cap, landmarker, bomi_map, cursor_filter, crs_x, crs_y, depth_cam, reachy, plan, geometry,
+        target_point, place_arm, crs_x, crs_y = reachy_selection.select_place_location_bomi(
+            cap, landmarker, bomi_map, cursor_filter, crs_x, crs_y, depth_cam, reachy, grasp_plans, geometry,
         )
         if target_point is None:
-            return None, crs_x, crs_y
+            return None, None, crs_x, crs_y
 
         decision, crs_x, crs_y = reachy_selection.confirm_place_bomi(
             cap, landmarker, bomi_map, cursor_filter, crs_x, crs_y,
         )
         if decision is None:
-            return None, crs_x, crs_y
+            return None, None, crs_x, crs_y
         if decision:
-            return target_point, crs_x, crs_y
+            return target_point, place_arm, crs_x, crs_y
         # decision is False -> back to picking a point
 
 
@@ -421,15 +429,17 @@ def _resolve_and_confirm_place_point(
 MAX_GRASP_ATTEMPTS = 3
 
 
-def _replan_and_execute_grasp(reachy, geometry, target_point) -> tuple:
+def _replan_and_execute_grasp(reachy, geometry, target_point, arm_name: str) -> tuple:
     """Repeats plan_grasp -> plan_place -> execute_grasp up to
-    MAX_GRASP_ATTEMPTS times (see its comment for why). execute_grasp only
-    starts moving once its own IK pre-check passes for all 3 poses, so a
-    failed attempt here never leaves the arm mid-motion -- safe to just
-    retry with a fresh plan. Returns (plan, place_plan) from whichever
-    attempt succeeded, or (None, None) if every attempt failed."""
+    MAX_GRASP_ATTEMPTS times (see its comment for why), all pinned to
+    arm_name -- the arm the confirmed placement cell needs, which is what
+    settled the left/right choice. execute_grasp only starts moving once its
+    own IK pre-check passes for all 3 poses, so a failed attempt here never
+    leaves the arm mid-motion -- safe to just retry with a fresh plan.
+    Returns (plan, place_plan) from whichever attempt succeeded, or
+    (None, None) if every attempt failed."""
     for attempt in range(1, MAX_GRASP_ATTEMPTS + 1):
-        plan = reachy_grasp.plan_grasp(reachy, geometry)
+        plan = reachy_grasp.plan_grasp(reachy, geometry, arm_name=arm_name)
         if plan is None:
             continue
         place_plan = reachy_grasp.plan_place(reachy, plan, geometry.table_normal, target_point)

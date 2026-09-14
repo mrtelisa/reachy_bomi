@@ -186,15 +186,10 @@ def is_roughly_reachable(
 
 
 # --- Grasp planning ---
-def plan_grasp(reachy: ReachySDK, geometry: ObjectGeometry) -> Optional[GraspPlan]:
-    """Pre-grasp + grasp + lift end-effector poses for `geometry`, or None
-    if its pose couldn't be estimated or it's too wide for the gripper.
-
-    Approaches horizontally at GRASP_HEIGHT_FRACTION of the object's
-    height. For each arm, searches _approach_candidates for a direction IK accepts 
-    for both pregrasp and grasp. Falls back to the near-side arm at the default 
-    direction if nothing is found, so a plan is always returned to inspect even if 
-    execute_grasp will then refuse to move."""
+def _grasp_targets(geometry: ObjectGeometry) -> Optional[tuple]:
+    """(mid_position, radius, table_normal) -- where along the object to
+    close the gripper and how far out its surface is -- or None if the
+    object's pose couldn't be estimated or it's too wide for the gripper."""
     if geometry.centroid is None or geometry.axes is None:
         return None
     if not (0 < geometry.width_m <= GRIPPER_MAX_OPENING_M):
@@ -202,67 +197,102 @@ def plan_grasp(reachy: ReachySDK, geometry: ObjectGeometry) -> Optional[GraspPla
 
     table_normal = geometry.table_normal if geometry.table_normal is not None else DEFAULT_TABLE_NORMAL
     table_normal = table_normal / np.linalg.norm(table_normal)
-
     mid_position = (
         geometry.centroid if geometry.shape == "sphere"
         else _grasp_height_position(geometry, table_normal)
     )
-    radius = geometry.width_m / 2.0
+    return mid_position, geometry.width_m / 2.0, table_normal
 
-    def _pregrasp_grasp_rotation_for(approach: npt.NDArray[np.float64], arm_name: str):
-        margin = _GRASP_APPROACH_MARGIN_BY_ARM[arm_name]
+
+def _plan_grasp_for_arm(
+    reachy: ReachySDK, arm_name: str, mid_position: npt.NDArray[np.float64], radius: float,
+    table_normal: npt.NDArray[np.float64], count: int = APPROACH_CANDIDATE_COUNT,
+) -> Optional[GraspPlan]:
+    """Pre-grasp + grasp + lift poses for one specific arm: the first of
+    `count` horizontal approach directions whose pregrasp and grasp poses IK
+    both accept, or None if that arm can't reach the object on any of them."""
+    arm = getattr(reachy, arm_name, None)
+    if arm is None:
+        return None
+    margin = _GRASP_APPROACH_MARGIN_BY_ARM[arm_name]
+
+    for approach in _approach_candidates(mid_position, table_normal, count=count):
         grasp_position = mid_position - (radius + margin) * approach
         pregrasp_position = grasp_position - approach * PREGRASP_STANDOFF_M
         rotation = _orientation_from_approach(approach, _side_grasp_closing_axis(approach, table_normal))
-        return pregrasp_position, grasp_position, rotation
+        try:
+            arm.inverse_kinematics(_pose_matrix(rotation, pregrasp_position))
+            arm.inverse_kinematics(_pose_matrix(rotation, grasp_position))
+        except ValueError:
+            continue
+
+        return GraspPlan(
+            arm_name=arm_name,
+            pregrasp_matrix=_pose_matrix(rotation, pregrasp_position),
+            grasp_matrix=_pose_matrix(rotation, grasp_position),
+            lift_matrix=_pose_matrix(rotation, grasp_position + table_normal * GRASP_LIFT_M),
+        )
+    return None
+
+
+def plan_grasps_by_arm(
+    reachy: ReachySDK, geometry: ObjectGeometry, count: int = APPROACH_CANDIDATE_COUNT,
+) -> dict:
+    """{arm_name: GraspPlan} for every arm that can actually pick `geometry`
+    up -- empty if neither can (or its pose couldn't be estimated / it's too
+    wide for the gripper). Near-side arm first.
+
+    The placement grid needs all of them, not a single winner: which arm
+    ends up doing the job depends on where the user chooses to put the
+    object down, which isn't known yet at grasp-planning time. An object
+    only one arm can pick up filters the grid to that arm's reach; one both
+    can pick up shows the union, and the chosen cell decides the arm."""
+    targets = _grasp_targets(geometry)
+    if targets is None:
+        return {}
+    mid_position, radius, table_normal = targets
 
     near_side = "r_arm" if mid_position[1] < 0 else "l_arm"
     far_side = "l_arm" if near_side == "r_arm" else "r_arm"
 
-    # Fallback if nothing below is confirmed reachable: the single most
-    # direct line, near-side arm
-    arm_name = near_side
-    approach = _approach_candidates(mid_position, table_normal)[0]
-    pregrasp_position, grasp_position, rotation = _pregrasp_grasp_rotation_for(approach, arm_name)
+    plans = {}
+    for arm_name in (near_side, far_side):
+        plan = _plan_grasp_for_arm(reachy, arm_name, mid_position, radius, table_normal, count=count)
+        if plan is not None:
+            plans[arm_name] = plan
 
-    found = False
-    for candidate_arm_name in (near_side, far_side):
-        arm = getattr(reachy, candidate_arm_name, None)
-        if arm is None:
-            continue
-        for candidate_approach in _approach_candidates(mid_position, table_normal):
-            candidate_pregrasp_position, candidate_grasp_position, candidate_rotation = \
-                _pregrasp_grasp_rotation_for(candidate_approach, candidate_arm_name)
-            try:
-                arm.inverse_kinematics(_pose_matrix(candidate_rotation, candidate_pregrasp_position))
-                arm.inverse_kinematics(_pose_matrix(candidate_rotation, candidate_grasp_position))
-            except ValueError:
-                continue
-            arm_name = candidate_arm_name
-            approach = candidate_approach
-            rotation = candidate_rotation
-            pregrasp_position, grasp_position = candidate_pregrasp_position, candidate_grasp_position
-            found = True
-            break
-        else:
-            continue
-        break
+    print(f"[plan_grasp] can be picked up by: {', '.join(plans) if plans else 'neither arm'} "
+          f"({count} approach directions x 2 arms tried)")
+    return plans
 
-    lift_position = grasp_position + table_normal * GRASP_LIFT_M
 
-    if found:
-        print(f"[plan_grasp] found a reachable approach line for {arm_name} "
-              f"({APPROACH_CANDIDATE_COUNT} directions x 2 arms tried)")
+def plan_grasp(
+    reachy: ReachySDK, geometry: ObjectGeometry, arm_name: Optional[str] = None,
+) -> Optional[GraspPlan]:
+    """Pre-grasp + grasp + lift end-effector poses for `geometry`, or None if
+    its pose couldn't be estimated, it's too wide for the gripper, or no
+    approach direction is reachable.
+
+    Approaches horizontally at GRASP_HEIGHT_FRACTION of the object's height.
+    arm_name pins which arm to plan for -- which is what the placement grid
+    decides, see plan_grasps_by_arm; without it the near-side arm is tried
+    first, then the far-side one."""
+    targets = _grasp_targets(geometry)
+    if targets is None:
+        return None
+    mid_position, radius, table_normal = targets
+
+    if arm_name is not None:
+        candidates = (arm_name,)
     else:
-        print(f"[plan_grasp] WARNING: no approach line reachable on either arm -- "
-              f"falling back to {arm_name} at the default line, UNVALIDATED.")
+        near_side = "r_arm" if mid_position[1] < 0 else "l_arm"
+        candidates = (near_side, "l_arm" if near_side == "r_arm" else "r_arm")
 
-    return GraspPlan(
-        arm_name=arm_name,
-        pregrasp_matrix=_pose_matrix(rotation, pregrasp_position),
-        grasp_matrix=_pose_matrix(rotation, grasp_position),
-        lift_matrix=_pose_matrix(rotation, lift_position),
-    )
+    for candidate in candidates:
+        plan = _plan_grasp_for_arm(reachy, candidate, mid_position, radius, table_normal)
+        if plan is not None:
+            return plan
+    return None
 
 
 def plan_place(
