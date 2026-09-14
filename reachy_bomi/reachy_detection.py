@@ -52,7 +52,7 @@ COLOR_GREEN = (0, 255, 0)
 # to reduce noise. Camera and object are assumed static.
 DEPTH_ACCUMULATION_FRAMES = 10
 
-# Radius of the square patch _estimate_object_position/_estimate_object_width
+# Radius of the square patch estimate_position_at_pixel/_estimate_object_width
 # search around their target pixel for a valid depth reading, median'd for
 # robustness.
 CHEAP_DEPTH_SEARCH_RADIUS_PX = 15
@@ -140,12 +140,14 @@ def _estimate_object_width(
     return width_m
 
 
-def _estimate_object_position(
+def estimate_position_at_pixel(
     depth_cam: DepthCamera, depth_frame: np.ndarray, u: int, v: int,
     search_radius: int = CHEAP_DEPTH_SEARCH_RADIUS_PX,
 ) -> Optional[np.ndarray]:
-    """XYZ position [m] near pixel (u, v). None only if
-    no pixel in that whole patch has valid depth."""
+    """XYZ position [m], Reachy world frame, near pixel (u, v). None only if
+    no pixel in that whole patch has valid depth. Public: also used by
+    reachy_selection.select_place_location_bomi to turn a dwelled-on screen
+    point into a 3D placement target."""
     height, width = depth_frame.shape
     if not (0 <= v < height and 0 <= u < width):
         return None
@@ -204,7 +206,7 @@ def capture_and_detect(
         for _class_name, _conf, box in detections:
             x1, y1, x2, y2 = box
             u, v = (x1 + x2) // 2, (y1 + y2) // 2
-            positions[box] = _estimate_object_position(depth_cam, depth_frame, u, v)
+            positions[box] = estimate_position_at_pixel(depth_cam, depth_frame, u, v)
             widths[box] = _estimate_object_width(depth_cam, depth_frame, box)
 
     if is_selectable is not None:
@@ -220,6 +222,22 @@ def capture_and_detect(
         for class_name, conf, box in detections
     }
     return base_frame, detections, labels
+
+
+def capture_rgb_and_depth(depth_cam: DepthCamera) -> Optional[Tuple[np.ndarray, Optional[np.ndarray]]]:
+    """One live RGB (LEFT) + depth (DEPTH) frame grab, for callers that need a
+    live view without running YOLO on it (reachy_selection.select_place_location_bomi's
+    dwell-to-pick-a-point loop). None only if the RGB frame itself couldn't be
+    captured; the depth frame may come back None on its own if that grab
+    failed, since the RGB frame is still showable without it."""
+    result = depth_cam.get_frame(view=CameraView.LEFT)
+    if result is None:
+        return None
+    base_frame, _timestamp = result
+
+    depth_result = depth_cam.get_depth_frame(view=CameraView.DEPTH)
+    depth_frame = depth_result[0] if depth_result is not None else None
+    return base_frame, depth_frame
 
 
 # --- Filtering and point cloud creation ---

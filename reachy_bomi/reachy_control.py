@@ -40,14 +40,20 @@ Phase 3.5 - Pre-grasping pose (opened from Control):
     halved. Hold it centered to stop the base and open object selection.
 
 Phase 4 - Object selection / grasp (opened from Control):
-    Capture -> hover-to-select -> Yes/No confirm flow, see reachy_selection.py
+    Capture -> hover-to-select -> Yes/No confirm, see reachy_selection.py
     (select_object_to_grasp_bomi/confirm_grasp_bomi), every hover point being
-    the BoMI cursor. Answering "No" re-offers hover-select on a fresh capture;
-    quitting (Q/ESC/X) or a successful grasp both end the run.
-    On a successful lift, _place_back_and_wind_down puts the
-    object right back down where it was picked up, retracts both arms to
-    the pre-grasping posture, rotates the base 180 deg, returns to the default posture, 
-    then main()'s finally block powers everything off.
+    the BoMI cursor. Answering "No" re-offers hover-select on the same capture.
+    Confirming "Yes" moves to _resolve_and_confirm_place_plan: dwell-pick a
+    placement point (select_place_location_bomi, e.g. inside a box), silently
+    re-offering point selection while it's unreachable for the arm, then a
+    second Yes/No confirm (confirm_place_bomi) on the point itself -- "No"
+    re-offers point selection, quitting at either step aborts the object
+    (nothing has been grasped yet). Only once both are confirmed does
+    execute_grasp actually move the arm; _place_and_wind_down then lowers the
+    object at the confirmed point, retracts both arms to the pre-grasping
+    posture, rotates the base 180 deg, and returns to the default posture.
+    Quitting anywhere, or a successful place, ends the run; main()'s finally
+    block powers everything off.
 """
 
 import argparse
@@ -208,8 +214,12 @@ def _run_grasp_mode(cap, landmarker, bomi_map, cursor_filter, depth_cam, model, 
                               "or its pose couldn't be estimated)")
                     else:
                         #graphs.show_grasp_plan(geometry, plan)
-                        if reachy_grasp.execute_grasp(reachy, plan):
-                            _place_back_and_wind_down(reachy, mobile_base, plan)
+                        place_plan, crs_x, crs_y = _resolve_and_confirm_place_plan(
+                            cap, landmarker, bomi_map, cursor_filter, crs_x, crs_y,
+                            depth_cam, reachy, plan, geometry,
+                        )
+                        if place_plan is not None and reachy_grasp.execute_grasp(reachy, plan):
+                            _place_and_wind_down(reachy, mobile_base, place_plan)
                 break
             # if decision =  False -> back to the same captured frame/detections, all blue again
 
@@ -219,11 +229,140 @@ def _run_grasp_mode(cap, landmarker, bomi_map, cursor_filter, depth_cam, model, 
         _in_grasp_phase = False
 
 
-def _place_back_and_wind_down(reachy, mobile_base, plan: reachy_grasp.GraspPlan) -> None:
-    """Runs once, right after a successful grasp+lift: puts the object back
-    where it was picked up from and retreats to pregrasp. Then the base translates,
-    rotates and evetually returns to the default posture"""
-    reachy_grasp.place_back(reachy, plan)
+# Superseded by _place_and_wind_down below -- kept for reference/rollback
+# while the box-placement flow is still being tuned.
+# def _place_back_and_wind_down(reachy, mobile_base, plan: reachy_grasp.GraspPlan) -> None:
+#     """Runs once, right after a successful grasp+lift: puts the object back
+#     where it was picked up from and retreats to pregrasp. Then the base translates,
+#     rotates and evetually returns to the default posture"""
+#     reachy_grasp.place_back(reachy, plan)
+#
+#     if reachy.head is not None:
+#         reachy.head.goto_posture(duration=1.0, wait=False)
+#         stop_camera_viewer() # no-op if already stopped (Phase 4 switch stops it itself)
+#
+#     print(f"\nRetracting both arms to the pre-grasping posture "
+#           f"(elbow pitch {reachy_pregrasp.PRE_GRASP_ELBOW_PITCH_DEG:.0f} deg)...")
+#     goto_ids = reachy_pregrasp.goto_pre_grasp_pose(reachy)
+#     while not all(reachy.is_goto_finished(goto_id) for goto_id in goto_ids):
+#         time.sleep(0.1)
+#
+#     print(f"\nRotating the base {safety.SHUTDOWN_ROTATION_DEG:.0f} deg...")
+#     # Goes through the shared gate so a concurrent ESC-triggered shutdown
+#     # (racing on another thread) can't also rotate the base a second time.
+#     safety.rotate_base_once(mobile_base, reverse_cm=REVERSE_BASE_CM)
+#
+#     print("\nReturning to default posture...")
+#     reachy.goto_posture("default", duration=3.0, wait=True)
+
+
+# Superseded by _resolve_and_confirm_place_plan below, now that the place
+# point is chosen+confirmed *before* execute_grasp instead of after the lift
+# -- kept for reference/rollback while the box-placement flow is tuned.
+# def _resolve_place_plan(
+#     cap, landmarker, bomi_map, cursor_filter, crs_x, crs_y,
+#     depth_cam, reachy, plan: reachy_grasp.GraspPlan, geometry: reachy_grasp.ObjectGeometry,
+# ) -> tuple:
+#     """Dwell-selects a placement point (reachy_selection.select_place_location_bomi),
+#     retrying while the chosen point turns out unreachable for plan.arm_name.
+#     Returns (place GraspPlan, crs_x, crs_y), or (None, crs_x, crs_y) if the
+#     user quit instead of picking a point."""
+#     while True:
+#         target_point, crs_x, crs_y = reachy_selection.select_place_location_bomi(
+#             cap, landmarker, bomi_map, cursor_filter, crs_x, crs_y, depth_cam,
+#         )
+#         if target_point is None:
+#             return None, crs_x, crs_y
+#         place_plan = reachy_grasp.plan_place(reachy, plan, geometry.height_m, geometry.table_normal, target_point)
+#         if place_plan is not None:
+#             return place_plan, crs_x, crs_y
+#         print("[place] that point isn't reachable for the arm -- pick another spot")
+#
+#
+# def _place_in_box_and_wind_down(
+#     cap, landmarker, bomi_map, cursor_filter, crs_x, crs_y,
+#     depth_cam, reachy, mobile_base, plan: reachy_grasp.GraspPlan, geometry: reachy_grasp.ObjectGeometry,
+# ) -> tuple:
+#     """Runs once, right after a successful grasp+lift: lets the user
+#     dwell-pick where to set the object down (e.g. inside a box) and lowers it
+#     there, falling back to place_back at the original pickup spot if the user
+#     quits instead of picking a point. Then the arms retract, the base
+#     translates and rotates, and Reachy returns to the default posture, same
+#     tail as the old _place_back_and_wind_down. Returns (crs_x, crs_y)."""
+#     place_plan, crs_x, crs_y = _resolve_place_plan(
+#         cap, landmarker, bomi_map, cursor_filter, crs_x, crs_y, depth_cam, reachy, plan, geometry,
+#     )
+#     if place_plan is None:
+#         print("[place] no placement point chosen -- placing back at the pickup spot instead")
+#         reachy_grasp.place_back(reachy, plan)
+#     else:
+#         arm = getattr(reachy, place_plan.arm_name)
+#         arm.goto(place_plan.pregrasp_matrix, duration=reachy_grasp.ARM_GOTO_DURATION_S, wait=True)
+#         reachy_grasp.place_back(reachy, place_plan)
+#
+#     if reachy.head is not None:
+#         reachy.head.goto_posture(duration=1.0, wait=False)
+#         stop_camera_viewer() # no-op if already stopped (Phase 4 switch stops it itself)
+#
+#     print(f"\nRetracting both arms to the pre-grasping posture "
+#           f"(elbow pitch {reachy_pregrasp.PRE_GRASP_ELBOW_PITCH_DEG:.0f} deg)...")
+#     goto_ids = reachy_pregrasp.goto_pre_grasp_pose(reachy)
+#     while not all(reachy.is_goto_finished(goto_id) for goto_id in goto_ids):
+#         time.sleep(0.1)
+#
+#     print(f"\nRotating the base {safety.SHUTDOWN_ROTATION_DEG:.0f} deg...")
+#     # Goes through the shared gate so a concurrent ESC-triggered shutdown
+#     # (racing on another thread) can't also rotate the base a second time.
+#     safety.rotate_base_once(mobile_base, reverse_cm=REVERSE_BASE_CM)
+#
+#     print("\nReturning to default posture...")
+#     reachy.goto_posture("default", duration=3.0, wait=True)
+#
+#     return crs_x, crs_y
+
+
+def _resolve_and_confirm_place_plan(
+    cap, landmarker, bomi_map, cursor_filter, crs_x, crs_y,
+    depth_cam, reachy, plan: reachy_grasp.GraspPlan, geometry: reachy_grasp.ObjectGeometry,
+) -> tuple:
+    """Dwell-selects a placement point (reachy_selection.select_place_location_bomi),
+    silently re-offering point selection while the point is unreachable for
+    plan.arm_name, then asks a Yes/No dwell confirm on the point itself
+    (reachy_selection.confirm_place_bomi) -- "No" re-offers point selection.
+    Runs entirely before execute_grasp, so nothing has been physically
+    grasped yet: quitting at either step just aborts, nothing to place back.
+    Returns (confirmed place GraspPlan, crs_x, crs_y), or (None, crs_x, crs_y)
+    if the user quit instead of confirming a point."""
+    while True:
+        target_point, crs_x, crs_y = reachy_selection.select_place_location_bomi(
+            cap, landmarker, bomi_map, cursor_filter, crs_x, crs_y, depth_cam,
+        )
+        if target_point is None:
+            return None, crs_x, crs_y
+        place_plan = reachy_grasp.plan_place(reachy, plan, geometry.height_m, geometry.table_normal, target_point)
+        if place_plan is None:
+            print("[place] that point isn't reachable for the arm -- pick another spot")
+            continue
+
+        decision, crs_x, crs_y = reachy_selection.confirm_place_bomi(
+            cap, landmarker, bomi_map, cursor_filter, crs_x, crs_y,
+        )
+        if decision is None:
+            return None, crs_x, crs_y
+        if decision:
+            return place_plan, crs_x, crs_y
+        # decision is False -> back to picking a point
+
+
+def _place_and_wind_down(reachy, mobile_base, place_plan: reachy_grasp.GraspPlan) -> None:
+    """Runs once, right after a successful grasp+lift, with place_plan already
+    chosen and confirmed: moves to its pre-place hover, lowers the object
+    there and opens the gripper (place_back), then retracts both arms,
+    rotates the base, and returns to the default posture -- same tail as the
+    old _place_back_and_wind_down."""
+    arm = getattr(reachy, place_plan.arm_name)
+    arm.goto(place_plan.pregrasp_matrix, duration=reachy_grasp.ARM_GOTO_DURATION_S, wait=True)
+    reachy_grasp.place_back(reachy, place_plan)
 
     if reachy.head is not None:
         reachy.head.goto_posture(duration=1.0, wait=False)

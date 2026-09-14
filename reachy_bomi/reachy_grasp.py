@@ -23,9 +23,9 @@ GRIPPER_MAX_OPENING_M = 0.1 # [m], parallel gripper's max fingertip opening
 PREGRASP_STANDOFF_M = 0.10
 
 # How far straight up the arm lifts once the gripper has closed 
-GRASP_LIFT_M = 0.15
+GRASP_LIFT_M = 0.20
 
-ARM_GOTO_DURATION_S = 6.0
+ARM_GOTO_DURATION_S = 5.0 #[s]
 
 # How far outside the object's near surface (beyond its radius) the
 # commanded EE position sits, per arm -- the left arm has been observed to
@@ -256,6 +256,51 @@ def plan_grasp(reachy: ReachySDK, geometry: ObjectGeometry) -> Optional[GraspPla
         pregrasp_matrix=_pose_matrix(rotation, pregrasp_position),
         grasp_matrix=_pose_matrix(rotation, grasp_position),
         lift_matrix=_pose_matrix(rotation, lift_position),
+    )
+
+
+def plan_place(
+    reachy: ReachySDK, plan: GraspPlan, object_height_m: float,
+    table_normal: Optional[npt.NDArray[np.float64]], target_point: npt.NDArray[np.float64],
+) -> Optional[GraspPlan]:
+    """Place GraspPlan for the object plan already grasped, releasing it so
+    its base lands on target_point (e.g. a BoMI-dwelled point inside a box)
+    while it's held at GRASP_HEIGHT_FRACTION of its height -- the same
+    convention _grasp_height_position used to pick the original grasp point,
+    just aimed at a new surface instead of the one it was picked up from.
+
+    Keeps plan's arm and orientation unchanged (the gripper doesn't need to
+    reorient to place what it's already holding); the approach direction for
+    the pregrasp standoff is recovered from plan.grasp_matrix's rotation.
+    Returns None if either pose is unreachable for plan.arm_name, so the
+    caller can ask the user to dwell on a different point instead."""
+    arm = getattr(reachy, plan.arm_name, None)
+    if arm is None:
+        return None
+
+    normal = table_normal if table_normal is not None else DEFAULT_TABLE_NORMAL
+    normal = normal / np.linalg.norm(normal)
+
+    rotation = plan.grasp_matrix[:3, :3]
+    approach = -rotation[:, 2]  # inverse of _orientation_from_approach's local_z = -approach/||approach||
+
+    place_position = target_point + normal * (GRASP_HEIGHT_FRACTION * object_height_m)
+    pregrasp_position = place_position + approach * PREGRASP_STANDOFF_M
+
+    pregrasp_matrix = _pose_matrix(rotation, pregrasp_position)
+    place_matrix = _pose_matrix(rotation, place_position)
+    for name, matrix in (("pre-place", pregrasp_matrix), ("place", place_matrix)):
+        try:
+            arm.inverse_kinematics(matrix)
+        except ValueError:
+            print(f"[plan_place] {name} pose unreachable for {plan.arm_name}")
+            return None
+
+    return GraspPlan(
+        arm_name=plan.arm_name,
+        pregrasp_matrix=pregrasp_matrix,
+        grasp_matrix=place_matrix,
+        lift_matrix=pregrasp_matrix,  # unused by place_back; kept only to satisfy GraspPlan's shape
     )
 
 

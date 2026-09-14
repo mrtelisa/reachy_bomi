@@ -11,6 +11,7 @@ MouseTracker is a standalone alternative hover-point source, for driving the
 same box_contains/find_hovered_detection geometry from a real mouse instead.
 """
 
+import math
 import time
 from typing import List, Optional
 
@@ -37,6 +38,24 @@ REPOSITIONING_HOVER_SECONDS = DWELL_HOLD_SECONDS
 
 # Sentinel class_name for "user dwelled on Repositioning" - handled by reachy_control.py
 REPOSITION_REQUESTED = object()
+
+# --- Free-point placement dwell (e.g. "put it in the box") ---
+PLACE_HOVER_SECONDS = DWELL_HOLD_SECONDS
+
+# Radius (px) of the tolerance circle the cursor must stay inside to keep
+# dwelling on a placement point. Big enough to absorb the hand tremor the
+# BoMI cursor carries through even after cursor_filter's smoothing (nobody can
+# hold a hand-tracked cursor to an exact pixel for 3s); small enough that the
+# confirmed point still reads as "here", not "somewhere over there".
+PLACE_TARGET_RADIUS_PX = 40
+
+# EMA weight applied to the anchor each frame the cursor stays inside the
+# tolerance circle, so it drifts along with a slow, unintentional hand
+# movement instead of comparing forever against the very first sample (which
+# would spuriously reset the dwell for a tremor that wanders gradually).
+PLACE_ANCHOR_SMOOTHING = 0.15
+
+COLOR_PLACE_TARGET = (0, 255, 255)
 
 CONFIRM_WINDOW_NAME = "BoMI - Confirm Grasp"
 CONFIRM_CANVAS_WIDTH = 520
@@ -95,6 +114,19 @@ def draw_confirm_canvas(lines: List[str], yes_progress: float, no_progress: floa
 
 def _draw_bomi_cursor(frame: np.ndarray, x: int, y: int) -> None:
     cv2.drawMarker(frame, (x, y), COLOR_CURSOR, markerType=cv2.MARKER_CROSS, markerSize=20, thickness=2)
+
+
+def _draw_place_target(frame: np.ndarray, anchor_x: int, anchor_y: int, progress: float) -> None:
+    """Tolerance circle for select_place_location_bomi: an outline the user
+    dwells inside, filled clockwise as a pie to show progress -- same
+    affordance as the hover progress bars, just circular since there's no
+    YOLO box to draw it against."""
+    cv2.circle(frame, (anchor_x, anchor_y), PLACE_TARGET_RADIUS_PX, COLOR_PLACE_TARGET, 2)
+    if progress > 0:
+        cv2.ellipse(
+            frame, (anchor_x, anchor_y), (PLACE_TARGET_RADIUS_PX, PLACE_TARGET_RADIUS_PX),
+            -90, 0, 360 * progress, COLOR_PLACE_TARGET, -1,
+        )
 
 
 # --- Hover geometry ---
@@ -213,6 +245,84 @@ def select_object_to_grasp_bomi(
             return None, None, (base_frame, detections, labels), crs_x, crs_y
 
 
+def select_place_location_bomi(cap, landmarker, bomi_map, cursor_filter, crs_x, crs_y, depth_cam):
+    """Dwell-to-pick-a-point loop for placing an already-grasped object (e.g.
+    "put it in the box"): unlike select_object_to_grasp_bomi, the target
+    isn't a YOLO box, so the tolerance region is a fixed-radius circle
+    (_draw_place_target) that recenters itself on the cursor (PLACE_ANCHOR_SMOOTHING)
+    while the cursor stays inside it, and resets on a bigger, intentional move.
+
+    Confirmed by dwelling inside that circle for PLACE_HOVER_SECONDS. The
+    returned point is the median of every valid depth reading taken at the
+    anchor while dwelling, for the same per-pixel noise robustness
+    reachy_detection.build_object_point_cloud gets from fusing several depth
+    frames.
+
+    Returns (target point [xyz, m, Reachy world frame] or None if the user
+    quit, crs_x, crs_y)."""
+    anchor = None
+    hover_start = None
+    position_samples: List[np.ndarray] = []
+
+    print(f"\n=== PLACE LOCATION ===  Q = quit  |  hold the cursor inside the "
+          f"circle for {PLACE_HOVER_SECONDS:.0f}s to confirm where to place it")
+
+    while True:
+        _, crs_x, crs_y, _ = bomi_teleop.update_bomi_cursor(cap, landmarker, bomi_map, cursor_filter, crs_x, crs_y)
+
+        capture = reachy_detection.capture_rgb_and_depth(depth_cam)
+        if capture is None:
+            key = cv2.waitKey(1) & 0xFF
+            if safety.quit_requested(key, reachy_detection.CAM_WINDOW_NAME):
+                return None, crs_x, crs_y
+            continue
+        base_frame, depth_frame = capture
+        frame_h, frame_w = base_frame.shape[:2]
+
+        gx, gy = bomi_teleop.map_bomi_to_frame(crs_x, crs_y, frame_w, frame_h)
+        now = time.time()
+
+        if anchor is None:
+            anchor = (gx, gy)
+            hover_start = now
+            position_samples = []
+        elif math.hypot(gx - anchor[0], gy - anchor[1]) > PLACE_TARGET_RADIUS_PX:
+            anchor = (gx, gy)
+            hover_start = now
+            position_samples = []
+        else:
+            anchor = (
+                anchor[0] + PLACE_ANCHOR_SMOOTHING * (gx - anchor[0]),
+                anchor[1] + PLACE_ANCHOR_SMOOTHING * (gy - anchor[1]),
+            )
+
+        if depth_frame is not None:
+            position = reachy_detection.estimate_position_at_pixel(
+                depth_cam, depth_frame, int(anchor[0]), int(anchor[1]),
+            )
+            if position is not None:
+                position_samples.append(position)
+
+        hover_progress = min((now - hover_start) / PLACE_HOVER_SECONDS, 1.0)
+        if hover_progress >= 1.0:
+            if position_samples:
+                return np.median(np.stack(position_samples), axis=0), crs_x, crs_y
+            # Dwelled long enough but never got a valid depth reading at the
+            # anchor (e.g. hovering off the table/box edge) -- keep trying
+            # instead of returning a made-up point.
+            print("[place] no valid depth at that point -- keep dwelling somewhere else")
+            anchor, hover_start, position_samples = None, None, []
+
+        frame = base_frame.copy()
+        _draw_place_target(frame, int(anchor[0]), int(anchor[1]), hover_progress)
+        _draw_bomi_cursor(frame, gx, gy)
+        cv2.imshow(reachy_detection.CAM_WINDOW_NAME, frame)
+
+        key = cv2.waitKey(1) & 0xFF
+        if safety.quit_requested(key, reachy_detection.CAM_WINDOW_NAME):
+            return None, crs_x, crs_y
+
+
 def confirm_bomi(cap, landmarker, bomi_map, cursor_filter, crs_x, crs_y, lines: List[str], on_frame=None):
     """Generic Yes/No dwell dialog hovered with the BoMI cursor mapped into the
     confirm canvas, lines drawn top to bottom as the prompt.
@@ -259,6 +369,15 @@ def confirm_grasp_bomi(cap, landmarker, bomi_map, cursor_filter, crs_x, crs_y, c
     return confirm_bomi(
         cap, landmarker, bomi_map, cursor_filter, crs_x, crs_y,
         lines=[f"You have select the {class_name} to be grasped.", "Do you want to confirm?"],
+    )
+
+
+def confirm_place_bomi(cap, landmarker, bomi_map, cursor_filter, crs_x, crs_y):
+    """Yes/No dwell dialog confirming the dwell-picked placement point, before
+    the grasp is actually executed."""
+    return confirm_bomi(
+        cap, landmarker, bomi_map, cursor_filter, crs_x, crs_y,
+        lines=["You have selected where to place the object.", "Do you want to confirm?"],
     )
 
 
