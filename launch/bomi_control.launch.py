@@ -12,8 +12,7 @@ from reachy_bomi.scenarios import (
     SCENARIO_NAMES, resolve_world_for_scenario, resolve_bag_prefix_for_scenario, resolve_task_for_scenario,
 )
 
-BAG_OUTPUT_DIR = os.path.expanduser("~/reachy_bomi_bags")
-
+BAG_OUTPUT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "reachy_bomi_bags")
 
 def launch_setup(context, *args, **kwargs):
     scenario = LaunchConfiguration("scenario").perform(context)
