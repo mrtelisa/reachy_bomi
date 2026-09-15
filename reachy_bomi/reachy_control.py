@@ -10,7 +10,7 @@ mediapipe/opencv/ultralytics computation and the reachy2_sdk client live in
 the same process.
 
 Dependencies:
-    pip install reachy2-sdk mediapipe opencv-python scikit-learn numpy scipy ultralytics matplotlib pynput
+    pip install reachy2-sdk mediapipe opencv-python tensorflow numpy scipy ultralytics matplotlib pynput
 
 Usage:
     python3 reachy_control.py [robot_ip]
@@ -22,6 +22,15 @@ Usage:
         --model PATH         Path to the MediaPipe hand_landmarker.task model.
         --yolo-model PATH    YOLOv8 weights (.pt). Default: yolov8n.pt
         --conf FLOAT         Minimum YOLO detection confidence. Default: 0.5
+        --calib NAME         Saved calibration to load (skips the calibration phase).
+        --subject ID         Subject id for the session metrics file. Default: S000
+
+Session metrics (session_metrics.py) are written to results_robot/<subject>_session.json
+at the end of every run: test/navigation durations, repositioning count, objects
+moved, base path lengths per driving mode (+ normalized to
+session_metrics.DEFAULT_OPTIMAL_PATH_LENGTH, to be set before the session), the
+log dimensionless jerk of the navigation, the share of driving time spent in
+each of the 9 regions and how many dwells were done / declined.
 
 Camera streaming: Phase 3.5 and 4 spawn camera_viewer.py as their own OS process.
 
@@ -96,6 +105,7 @@ import reachy_pregrasp
 import reachy_selection
 import safety
 import bomi_teleop
+import session_metrics
 
 # Placeholder — replace with the robot's actual IP
 DEFAULT_ROBOT_IP = "192.168.0.121"
@@ -128,6 +138,20 @@ CAMERA_VIEWER_SCRIPT = os.path.join(os.path.dirname(os.path.abspath(__file__)), 
 # around, with nothing to back away from.
 _grasp_phase_entered = False
 _camera_viewer_proc: Optional[subprocess.Popen] = None # head-camera-viewer subprocess, if one is currently running
+# Session metrics (durations, path lengths, objects moved, ...), created in
+# main() and fed by the control loops below; see session_metrics.py.
+_metrics: Optional[session_metrics.SessionMetrics] = None
+
+
+def _sample_odometry(mobile_base, mode: str) -> None:
+    """Feed the base odometry to the session metrics (no-op if the base is
+    off or the SDK call fails)."""
+    if _metrics is None:
+        return
+    try:
+        _metrics.sample(mobile_base.get_current_odometry(degrees=False), mode)
+    except Exception as exc:  # odometry unavailable (base off, gRPC hiccup): skip this sample
+        print(f"[metrics] odometry read failed: {exc}")
 
 
 # --- Windows and camera streaming functions ---
@@ -185,6 +209,8 @@ def _run_grasp_mode(cap, landmarker, bomi_map, cursor_filter, depth_cam, model, 
     explicit wind-down -- main()'s finally block handles that generically."""
     global _grasp_phase_entered
     _grasp_phase_entered = True
+    if _metrics is not None:
+        _metrics.enter_object_selection()
     try:
         make_window_fullscreen(reachy_detection.CAM_WINDOW_NAME)
         captured = reachy_detection.capture_and_detect(
@@ -199,6 +225,8 @@ def _run_grasp_mode(cap, landmarker, bomi_map, cursor_filter, depth_cam, model, 
                 depth_cam, model, confidence, captured, reachy,
             )
             if class_name is reachy_selection.REPOSITION_REQUESTED:
+                if _metrics is not None:
+                    _metrics.repositioning()
                 crs_x, crs_y, quit_now = repositioning_navigation(
                     cap, landmarker, bomi_map, cursor_filter, crs_x, crs_y, mobile_base, robot_ip,
                 )
@@ -266,6 +294,8 @@ def _run_grasp_mode(cap, landmarker, bomi_map, cursor_filter, depth_cam, model, 
             if not _place_object(reachy, place_plan):
                 _abort_and_shutdown(reachy, mobile_base, f"[{class_name}] execute_place failed")
                 break
+            if _metrics is not None:
+                _metrics.object_moved(class_name)
             _retract_after_place(reachy)
 
             want_new_object, crs_x, crs_y = reachy_selection.confirm_new_object_bomi(
@@ -274,6 +304,8 @@ def _run_grasp_mode(cap, landmarker, bomi_map, cursor_filter, depth_cam, model, 
             if want_new_object is None:
                 break  # quit -- main()'s finally block handles safe shutdown
             if not want_new_object:
+                if _metrics is not None:
+                    _metrics.end_test("finished")   # the user does not want more objects: test over
                 _finish_session(reachy, mobile_base)
                 break
 
@@ -285,6 +317,8 @@ def _run_grasp_mode(cap, landmarker, bomi_map, cursor_filter, depth_cam, model, 
                 depth_cam, model, confidence, reachy_selection.presentable_filter(reachy),
             )
             if captured is None:
+                if _metrics is not None:
+                    _metrics.end_test("finished")
                 _finish_session(reachy, mobile_base)
                 break
 
@@ -536,6 +570,8 @@ def _abort_and_shutdown(reachy, mobile_base, reason: str) -> None:
     an ESC-triggered shutdown uses), then powers the robot off smoothly right
     away instead of pretending the run can continue."""
     print(f"[ERROR] {reason} -- plan aborted")
+    if _metrics is not None:
+        _metrics.end_test("aborted: " + reason)
     safety.rotate_base_once(mobile_base, reverse_cm=REVERSE_BASE_CM)
     reachy.turn_off_smoothly()
 
@@ -564,6 +600,8 @@ def teleop_with_grasp_switch(cap, landmarker, bomi_map, mobile_base, depth_cam, 
 
     print("\n=== CONTROL ===  Q = quit  |  hold the cursor centered (region 5) "
           f"for {SELECTION_HOLD_SECONDS:.0f}s to move to the pre-grasping pose")
+    if _metrics is not None:
+        _metrics.start_test()   # Reachy starts moving after the cursor preview: test starts here
 
     while True:
         # A quit watcher fires on its own thread and starts the shutdown --
@@ -596,6 +634,8 @@ def teleop_with_grasp_switch(cap, landmarker, bomi_map, mobile_base, depth_cam, 
         center_progress = (
             min((now - center_hold_start) / SELECTION_HOLD_SECONDS, 1.0) if center_hold_start else 0.0
         )
+        if _metrics is not None:
+            _metrics.region_tick(region, now)
 
         cv2.imshow(map_window, bomi_teleop.draw_cursor_map(crs_x, crs_y, region, message))
         cv2.moveWindow(map_window, *bomi_teleop.MAP_WINDOW_POS)  # a just-closed window can make the WM reclaim the position otherwise
@@ -608,6 +648,8 @@ def teleop_with_grasp_switch(cap, landmarker, bomi_map, mobile_base, depth_cam, 
                 lines=["Do you want to continue on the pipeline?"],
                 on_frame=_hold_base_still,
             )
+            if _metrics is not None:
+                _metrics.dwell(decision)
             if decision is None:
                 break
             center_hold_start = None
@@ -656,6 +698,8 @@ def teleop_with_grasp_switch(cap, landmarker, bomi_map, mobile_base, depth_cam, 
                 lines=["Do you want to continue on the pipeline?"],
                 on_frame=_hold_base_still,
             )
+            if _metrics is not None:
+                _metrics.dwell(decision)
             if decision is None:
                 break
             center_hold_start = None
@@ -688,6 +732,8 @@ def teleop_with_grasp_switch(cap, landmarker, bomi_map, mobile_base, depth_cam, 
             mobile_base.set_goal_speed(vx=lin_vel, vy=0, vtheta=math.degrees(ang_vel))
             mobile_base.send_speed_command()
             last_publish = now
+            _sample_odometry(mobile_base,
+                             session_metrics.MODE_REDUCED if pre_grasp_reached else session_metrics.MODE_MAX)
 
         key = cv2.waitKey(1) & 0xFF
         if safety.quit_requested(key, map_window):
@@ -759,6 +805,8 @@ def repositioning_navigation(cap, landmarker, bomi_map, cursor_filter, crs_x, cr
             center_progress = (
                 min((now - center_hold_start) / SELECTION_HOLD_SECONDS, 1.0) if center_hold_start else 0.0
             )
+            if _metrics is not None:
+                _metrics.region_tick(region, now)
 
             cv2.imshow(map_window, bomi_teleop.draw_cursor_map(crs_x, crs_y, region, message))
             cv2.moveWindow(map_window, *bomi_teleop.MAP_WINDOW_POS)  # a just-closed window can make the WM reclaim the position otherwise
@@ -766,6 +814,8 @@ def repositioning_navigation(cap, landmarker, bomi_map, cursor_filter, crs_x, cr
             safety.raise_window(map_window)  # actually wins over the cross-process fullscreen camera_viewer window
 
             if center_progress >= 1.0:
+                if _metrics is not None:
+                    _metrics.dwell(True)   # back to object selection
                 mobile_base.set_goal_speed(vx=0, vy=0, vtheta=0)
                 mobile_base.send_speed_command()
                 safety.destroy_window(map_window)
@@ -776,6 +826,7 @@ def repositioning_navigation(cap, landmarker, bomi_map, cursor_filter, crs_x, cr
                 mobile_base.set_goal_speed(vx=lin_vel, vy=0, vtheta=math.degrees(ang_vel))
                 mobile_base.send_speed_command()
                 last_publish = now
+                _sample_odometry(mobile_base, session_metrics.MODE_REPOSITIONING)
 
             key = cv2.waitKey(1) & 0xFF
             if safety.quit_requested(key, map_window):
@@ -806,7 +857,14 @@ def main() -> None:
     parser.add_argument("--calib", default=None,
                         help="Name of a calibration saved by calibrate_bomi.py to load instead of "
                              "running the calibration phase")
+    parser.add_argument("--subject", default="S000",
+                        help="Subject id for the session metrics file in results_robot/ (default: S000)")
     cli_args = parser.parse_args()
+
+    global _metrics
+    # The optimal path length for normalized_path_length is
+    # session_metrics.DEFAULT_OPTIMAL_PATH_LENGTH: set it there before the session.
+    _metrics = session_metrics.SessionMetrics(cli_args.subject, dwell_seconds=SELECTION_HOLD_SECONDS)
 
     if not os.path.exists(cli_args.model):
         print(f"[ERROR] MediaPipe model not found: '{cli_args.model}'")
@@ -912,6 +970,13 @@ def main() -> None:
         stop_camera_viewer()
         if stop_terminal_watcher is not None:
             stop_terminal_watcher()
+        # Session metrics: a run that ends any way other than "no more objects"
+        # is closed here as a quit, then written out whatever happened.
+        _metrics.end_test("quit")
+        summary = _metrics.save()
+        print(f"[metrics] test {summary['test_duration'] or 0:.0f}s, navigation {summary['navigation_duration'] or 0:.0f}s, "
+              f"path {summary['path_length_total']:.2f} m (nav {summary['path_length_navigation']:.2f} m), "
+              f"{summary['n_repositioning']} repositioning, objects moved: {summary['objects_moved']}")
         safety.safe_robot_shutdown(reachy, mobile_base, rotate_base_before_shutdown=_grasp_phase_entered)
         if cap is not None:
             cap.release()
