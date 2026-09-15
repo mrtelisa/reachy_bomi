@@ -106,21 +106,23 @@ Launch arguments:
 # First time (or to recalibrate): run the calibration phase and save it
 python3 socket_client.py <robot_ip> --calibrate [--calib bomi_calib.npz] [--model scripts/hand_landmarker.task] \
     [--port 5051] [--cam 0] \
-    [--scenario familiarization] [--start-rviz true] [--record true] [--sim-wait 25]
+    [--scenario familiarization] [--start-rviz true] [--record true] [--sim-wait 18] [--sim-url URL] [--show-cam]
 
 # Next times: load the saved calibration, skip straight to control
 python3 socket_client.py <robot_ip> [--model scripts/hand_landmarker.task] [--port 5051] [--cam 0] \
-    [--scenario familiarization] [--start-rviz true] [--record true] [--sim-wait 25]
+    [--scenario familiarization] [--start-rviz true] [--record true] [--sim-wait 18] [--sim-url URL] [--show-cam]
 ```
 
-`<robot_ip>` is optional if you've set `DEFAULT_HOST` in `socket_client.py` to your robot's IP; otherwise pass it explicitly. If `--scenario` is given, the client sends `scenario:<name> rviz:<start_rviz> record:<record>` to the bridge right after connecting, waits `--sim-wait` seconds for the simulation to come up, and only then starts calibration/control. If `--scenario` is omitted, no scenario request is sent (useful when a scenario is already running, e.g. launched manually per step 1).
+`<robot_ip>` is optional if you've set `DEFAULT_HOST` in `socket_client.py` to your robot's IP; otherwise pass it explicitly. If `--scenario` is given, the client sends `scenario:<name> rviz:<start_rviz> record:<record>` to the bridge right after connecting, opens the simulation view (`--sim-url`, by default the noVNC page served by the Reachy container on `http://localhost:6080`) in the default browser, waits `--sim-wait` seconds for the simulation to come up, and only then starts calibration/control. If `--scenario` is omitted, no scenario request is sent (useful when a scenario is already running, e.g. launched manually per step 1).
 
 `--calibrate` is **opt-in**: without it, `socket_client.py` skips Phase 1 entirely and loads the saved calibration file (`--calib`, a bare filename is stored in the package's `calibrations/` folder; default `bomi_calib.npz`) — it fails immediately if that file doesn't exist yet. Pass `--calibrate` the first time, or whenever you want to redo it.
 
 **Phase 1 — Calibration** (only with `--calibrate`): move your hand through all the positions you intend to use.
 `SPACE` records a sample, `ENTER` finishes (minimum 30 samples), `Q`/`Esc`/closing the window quits.
 
-**Phase 2 — Control:** your hand drives the cursor; the cursor position is mapped to base velocities and streamed to the robot. Two windows are shown: the webcam feed with the hand landmarks, and a map of the virtual screen with the 9-region grid lines and a dot at the current cursor position. Press `Q`/`Esc`, or close either window, to stop the robot and quit.
+**Phase 2 — Cursor preview:** the cursor map is shown but nothing is sent to the robot, so you can get a feel for the cursor. Hold it in the centre region (5) for 5 s to start Control.
+
+**Phase 3 — Control:** your hand drives the cursor; the cursor position is mapped to base velocities and streamed to the robot. A small map of the virtual screen with the 9-region grid lines and a dot at the current cursor position is shown, pinned to the top-left corner of the screen and kept above the browser window with the simulation (`wmctrl` recommended: `sudo apt install wmctrl`). Add `--show-cam` to also see the webcam feed with the hand landmarks. Press `Q`/`Esc`, or close the window, to stop the robot and quit.
 
 The control area is a 3×3 grid with a dead zone in the centre:
 

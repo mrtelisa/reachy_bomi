@@ -4,7 +4,8 @@ BoMI client for Reachy2 teleoperation.
 Runs on the operator PC, NOT on the robot.
 
 Dependencies:
-    pip install mediapipe opencv-python scikit-learn numpy scipy
+    pip install mediapipe opencv-python tensorflow numpy scipy
+    (optional: `sudo apt install wmctrl` to keep the cursor map above the browser)
 
 Usage:
     # First time: run calibration and save it to the calib file
@@ -29,30 +30,41 @@ Usage:
                                (e.g. "familiarization"). If omitted, no scenario message
                                is sent and --start-rviz/--record/--sim-wait are ignored.
         --start-rviz true|false  Whether the robot side should start RViz for this
-                               scenario. Default: true
+                               scenario. Default: false
         --record true|false    Whether the robot side should record a ROS 2 bag for
                                this scenario. Default: true
         --sim-wait SECONDS     Seconds to wait after sending the scenario, to give the
                                robot side time to bring up the simulation before the
-                               control loop starts sending velocities. Default: 25.0
+                               control loop starts sending velocities. Default: 10.0
+        --sim-url URL          Page opened in the default browser right after the
+                               scenario is sent (the noVNC view of Gazebo). Pass ""
+                               to open nothing. Default: the noVNC URL on localhost.
+        --show-cam             Also show the webcam feed with landmarks during
+                               control (off by default: only the cursor map is shown).
 
 Phase 1 - Calibration (only with --calibrate):
     Move your hand through all positions you intend to use.
     SPACE = record sample   |   ENTER = finish (min 30 samples required)
 
-Phase 2 - Control:
+Phase 2 - Cursor preview:
+    Same cursor map as Control, but nothing is sent to the robot. Hold the
+    cursor in the centre region (5) for 5 s to start Control.
+
+Phase 3 - Control:
     Hand movement -> autoencoder cursor -> 9-region velocity -> TCP socket to robot.
-    Opens two windows: the webcam feed with landmarks, and a map of the
-    virtual screen with the 9-region grid lines and a dot at the current
-    cursor position.
-    Q, ESC, or closing a window with the X = quit and stop robot.
+    Shows a small map of the virtual screen with the 9-region grid lines and a
+    dot at the current cursor position, pinned to the top-left corner and kept
+    above the other windows (e.g. the browser with the simulation).
+    Q, ESC, or closing the window with the X = quit and stop robot.
 """
 
 import argparse
 import os
 import socket
+import subprocess
 import sys
 import time
+import webbrowser
 
 os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "2")
 
@@ -120,6 +132,19 @@ def _resolve_calib_path(calib_arg: str) -> str:
 # the same cursor map window as the control phase.
 CAM_WINDOW_NAME = "BoMI - Control"
 MAP_WINDOW_NAME = "BoMI - Cursor Map"
+
+# Cursor map window: size in pixels and screen position (top-left corner) it
+# is pinned to, so it sits in a corner above the browser showing the simulation.
+MAP_WINDOW_SIZE = (510, 300)
+MAP_WINDOW_POS = (0, 0)
+
+# Cursor preview: seconds the cursor must stay in the centre region (5) before
+# the control phase starts sending velocities to the robot.
+PREVIEW_HOLD_SECONDS = 5.0
+
+# Browser page showing the simulation (noVNC served by the Reachy container),
+# opened right after the scenario request is sent.
+DEFAULT_SIM_URL = "http://localhost:6080/vnc.html?autoconnect=1&resize=remote"
 
 
 # --- Velocity helpers (adapted from reaching_functions.py) ---------
@@ -243,7 +268,7 @@ def _quit_requested(key: int, window_name: str) -> bool:
 
 
 def _draw_cursor_map(crs_x: float, crs_y: float, region: int, message: str,
-                      map_width: int = 850, map_height: int = 500):
+                      map_width: int = MAP_WINDOW_SIZE[0], map_height: int = MAP_WINDOW_SIZE[1]):
     """Rectangle representing the BASE_WIDTH x BASE_HEIGHT virtual screen, with
     the 9-region grid lines, a dot at the current cursor position, and the
     lin_vel/ang_vel message currently being sent to the robot."""
@@ -259,13 +284,42 @@ def _draw_cursor_map(crs_x: float, crs_y: float, region: int, message: str,
         cv2.line(canvas, (0, y), (map_width, y), (90, 90, 90), 1)
 
     cx, cy = int(crs_x * sx), int(crs_y * sy)
-    cv2.circle(canvas, (cx, cy), 10, (0, 0, 255), -1)
+    cv2.circle(canvas, (cx, cy), 8, (0, 0, 255), -1)
 
     cv2.putText(canvas, f"region={region}  cursor=({crs_x:.0f},{crs_y:.0f})",
                 (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
     cv2.putText(canvas, f"-> PC2: {message}",
                 (10, 50), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
     return canvas
+
+
+_last_raise_time = 0.0
+_RAISE_WINDOW_INTERVAL_S = 1.0
+_wmctrl_missing_warned = False
+
+
+def _pin_map_window(window_name: str) -> None:
+    """Keep the cursor map in its corner and above the other windows (the
+    browser showing the simulation). Safe to call every frame.
+
+    cv2's WND_PROP_TOPMOST only wins over windows of the *same process*, so the
+    window is also re-activated via wmctrl (same as alt-tabbing to it), throttled
+    to once per second. No-ops (after one warning) if wmctrl isn't installed."""
+    global _last_raise_time, _wmctrl_missing_warned
+    cv2.moveWindow(window_name, *MAP_WINDOW_POS)  # a just-closed window can make the WM reclaim the position otherwise
+    cv2.setWindowProperty(window_name, cv2.WND_PROP_TOPMOST, 1)
+
+    now = time.time()
+    if now - _last_raise_time < _RAISE_WINDOW_INTERVAL_S:
+        return
+    _last_raise_time = now
+    try:
+        subprocess.run(["wmctrl", "-a", window_name], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except FileNotFoundError:
+        if not _wmctrl_missing_warned:
+            print("[WARN] wmctrl not installed -- the cursor map may not stay in front "
+                  "(sudo apt install wmctrl).")
+            _wmctrl_missing_warned = True
 
 
 class CursorFilter:
@@ -604,15 +658,85 @@ def _calibration_phase(cap, landmarker) -> list:
     return samples
 
 
-def _control_phase(cap, landmarker, bomi_map: BoMIMap, robot: RobotSocket) -> None:
+def _cursor_preview_phase(cap, landmarker, bomi_map: BoMIMap, cursor_filter: CursorFilter,
+                          show_cam: bool = False, hold_seconds: float = PREVIEW_HOLD_SECONDS) -> tuple:
+    """
+    Shows the same cursor/region view as the control phase, but nothing is
+    sent to the robot -- lets the user get a feel for the cursor before it
+    starts driving anything. Ends once the cursor has been held in the centre
+    region (5) for hold_seconds; returns the final (crs_x, crs_y) so the
+    control phase can continue from the same cursor state.
+    """
+    cam_window = CAM_WINDOW_NAME
+    map_window = MAP_WINDOW_NAME
+
+    crs_x, crs_y = BASE_WIDTH / 2.0, BASE_HEIGHT / 2.0
+    region = check_region_cursor(crs_x, crs_y)
+    center_hold_start = None
+
+    print("\n=== CURSOR PREVIEW (robot not moving) ===")
+    print(f"Get a feel for the cursor. Hold it centered (region 5) for {hold_seconds:.0f}s "
+          "to start Control   |   Q = quit")
+
+    while True:
+        frame, crs_x, crs_y, hand_detected = update_bomi_cursor(
+            cap, landmarker, bomi_map, cursor_filter, crs_x, crs_y,
+        )
+        if frame is None:
+            continue
+        if hand_detected:
+            region = check_region_cursor(crs_x, crs_y)
+
+        now = time.time()
+        # Only accrue while actively tracked and centered, so a dropped hand
+        # while the stale cursor happens to sit in region 5 can't silently
+        # trigger the switch.
+        center_hold_start = (center_hold_start or now) if (hand_detected and region == 5) else None
+        center_progress = min((now - center_hold_start) / hold_seconds, 1.0) if center_hold_start else 0.0
+
+        if show_cam:
+            cv2.putText(
+                frame, f"region={region}  cursor=({crs_x:.0f},{crs_y:.0f})",
+                (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2,
+            )
+            cv2.putText(
+                frame, f"PREVIEW - robot not moving. Hold centered: {center_progress * 100:.0f}%  Q=quit",
+                (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2,
+            )
+            cv2.imshow(cam_window, frame)
+        cv2.imshow(map_window, _draw_cursor_map(
+            crs_x, crs_y, region, f"PREVIEW (not sent) - hold centered: {center_progress * 100:.0f}%",
+        ))
+        _pin_map_window(map_window)
+
+        key = cv2.waitKey(1) & 0xFF
+        if center_progress >= 1.0:
+            break
+        if (show_cam and _quit_requested(key, cam_window)) or _quit_requested(key, map_window):
+            print("Aborted.")
+            sys.exit(0)
+
+    # Windows are intentionally left open so the same cam/map windows carry
+    # straight into the control phase instead of flickering shut.
+    return crs_x, crs_y
+
+
+def _control_phase(cap, landmarker, bomi_map: BoMIMap, robot: RobotSocket,
+                   show_cam: bool = False, cursor_filter: CursorFilter = None,
+                   crs_x: float = None, crs_y: float = None) -> None:
+    """show_cam=False (default) only shows the cursor map, pinned in its
+    corner; True also shows the webcam feed with the landmarks.
+    Pass the preview phase's cursor_filter/crs_x/crs_y to continue from its
+    cursor state instead of restarting centered."""
     dt = 1.0 / SEND_HZ
     last_send = time.time()
-    cursor_filter = CursorFilter()
+    cursor_filter = cursor_filter or CursorFilter()
     cam_window = CAM_WINDOW_NAME
     map_window = MAP_WINDOW_NAME
 
     # Start centered (region 5) until the first hand detection updates it.
-    crs_x, crs_y = BASE_WIDTH / 2.0, BASE_HEIGHT / 2.0
+    if crs_x is None or crs_y is None:
+        crs_x, crs_y = BASE_WIDTH / 2.0, BASE_HEIGHT / 2.0
     region = check_region_cursor(crs_x, crs_y)
     message = "lin_vel:0.000 ang_vel:0.000"
 
@@ -640,14 +764,15 @@ def _control_phase(cap, landmarker, bomi_map: BoMIMap, robot: RobotSocket) -> No
             lin_vel, ang_vel = compute_dynamic_vel_from_cursor(crs_x, crs_y)
             lin_vel, ang_vel = apply_region_velocity_mask(region, lin_vel, ang_vel)
 
-            cv2.putText(
-                frame, f"region={region}  cursor=({crs_x:.0f},{crs_y:.0f})",
-                (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2,
-            )
-            cv2.putText(
-                frame, f"-> PC2: {message}",
-                (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2,
-            )
+            if show_cam:
+                cv2.putText(
+                    frame, f"region={region}  cursor=({crs_x:.0f},{crs_y:.0f})",
+                    (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2,
+                )
+                cv2.putText(
+                    frame, f"-> PC2: {message}",
+                    (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2,
+                )
 
         now = time.time()
         if now - last_send >= dt:
@@ -655,15 +780,18 @@ def _control_phase(cap, landmarker, bomi_map: BoMIMap, robot: RobotSocket) -> No
             robot.send(message)
             last_send = now
 
-        cv2.imshow(cam_window, frame)
+        if show_cam:
+            cv2.imshow(cam_window, frame)
         cv2.imshow(map_window, _draw_cursor_map(crs_x, crs_y, region, message))
+        _pin_map_window(map_window)
 
         key = cv2.waitKey(1) & 0xFF
-        if _quit_requested(key, cam_window) or _quit_requested(key, map_window):
+        if (show_cam and _quit_requested(key, cam_window)) or _quit_requested(key, map_window):
             break
 
     robot.send("lin_vel:0.000 ang_vel:0.000")
-    cv2.destroyWindow(cam_window)
+    if show_cam:
+        cv2.destroyWindow(cam_window)
     cv2.destroyWindow(map_window)
 
 
@@ -685,16 +813,23 @@ def main() -> None:
     parser.add_argument("--scenario", default=None,
                         help="Scenario name to send to the robot right after connecting "
                              "(e.g. 'familiarization'). Omit to skip sending a scenario.")
-    parser.add_argument("--start-rviz", choices=["true", "false"], default="true",
+    parser.add_argument("--start-rviz", choices=["true", "false"], default="false",
                         help="Whether the robot side should start RViz for this scenario "
                              "(default: true). Only used if --scenario is set.")
     parser.add_argument("--record", choices=["true", "false"], default="true",
                         help="Whether the robot side should record a ROS 2 bag for this "
                              "scenario (default: true). Only used if --scenario is set.")
-    parser.add_argument("--sim-wait", type=float, default=25.0,
+    parser.add_argument("--sim-wait", type=float, default=10.0,
                         help="Seconds to wait after sending the scenario before starting "
                              "the control loop, to let the robot side bring up the "
-                             "simulation (default: 25.0).")
+                             "simulation (default: 10.0).")
+    parser.add_argument("--sim-url", default=DEFAULT_SIM_URL,
+                        help="Page opened in the default browser right after the scenario "
+                             "is sent (noVNC view of the simulation). Pass \"\" to open "
+                             f"nothing (default: {DEFAULT_SIM_URL}).")
+    parser.add_argument("--show-cam", action="store_true",
+                        help="Also show the webcam feed with landmarks during control "
+                             "(default: only the cursor map is shown).")
     args = parser.parse_args()
 
     calib_path = _resolve_calib_path(args.calib)
@@ -720,6 +855,11 @@ def main() -> None:
             scenario_msg = f"scenario:{args.scenario} rviz:{args.start_rviz} record:{args.record}"
             print(f"[SCENARIO] Sending '{scenario_msg}' to the robot")
             robot.send(scenario_msg)
+            if args.sim_url:
+                # Open the simulation view right away, so it is on screen by the
+                # time the cursor map appears on top of it.
+                print(f"[SCENARIO] Opening {args.sim_url} in the browser")
+                webbrowser.open_new_tab(args.sim_url)
             print(f"[SCENARIO] Waiting {args.sim_wait:.0f}s for the simulation to start...")
             time.sleep(args.sim_wait)
 
@@ -749,7 +889,11 @@ def main() -> None:
             bomi_map.load(calib_path)
             print(f"Loaded calibration from {calib_path} (no calibration phase)")
 
-        _control_phase(cap, landmarker, bomi_map, robot)
+        cursor_filter = CursorFilter()
+        crs_x, crs_y = _cursor_preview_phase(cap, landmarker, bomi_map, cursor_filter,
+                                             show_cam=args.show_cam)
+        _control_phase(cap, landmarker, bomi_map, robot, show_cam=args.show_cam,
+                       cursor_filter=cursor_filter, crs_x=crs_x, crs_y=crs_y)
     finally:
         robot.close()
         if cap is not None:
