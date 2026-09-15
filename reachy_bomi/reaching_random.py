@@ -28,10 +28,10 @@ import reaching_center_out as base
 RESULTS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "results_random")
 
 
-def build_trials(order: list) -> list:
+def build_trials() -> list:
     """One goal at the centre, then every target of the center-out sequence
     in the same order, with no return to the centre in between."""
-    center_out = base.build_trials(order)
+    center_out = base.build_trials()
     home = next(t for t in center_out if t["kind"] == "home")
     targets = [t for t in center_out if t["kind"] == "target"]
     return [home] + targets

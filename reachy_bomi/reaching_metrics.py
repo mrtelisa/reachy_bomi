@@ -118,7 +118,7 @@ def compute_trial_metrics(samples, goal, t_shown, t_reach, onset_speed, peak_thr
     return m
 
 
-def summarize(results: list, keys=("reach_time", "movement_time", "normalized_path_length",
+def summarize(results: list, keys=("reaction_time", "reach_time", "movement_time", "normalized_path_length",
                                    "max_deviation", "log_dimensionless_jerk", "n_speed_peaks")) -> dict:
     """Success counts/rates plus the mean of each metric over successful trials."""
     n = len(results)

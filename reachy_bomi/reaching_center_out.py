@@ -9,13 +9,12 @@ are those of markerlessBoMI's main_reaching.py / reaching.py:
 
   virtual canvas 1200 x 650 (scaled to the whole screen, aspect preserved),
   home at the centre, targets spread over the whole canvas (seeded random
-  point in each cell of a 6x3 grid, all cells before any repeat), target
+  point in each cell of a 6x3 grid, all cells before any repeat; the 248
+  positions are frozen in config/cursor_targets.csv), target
   radius 40 px, cursor radius 15 px, dwell 1 s inside the target,
-  11 blocks (8 targets x 1 repetition in blocks 1/6/11, 4 targets x 7
-  repetitions in the others), all center-out: centre -> target -> centre ->
-  target ... -- 248 targets, 496 goals in total -- score 4/3/2/1 by reach
-  time. The "blind" trials of the original are not reproduced: the cursor is
-  always visible.
+  N_TARGETS (248, as in the original) targets, center-out: centre -> target
+  -> centre -> target ... (496 goals in total), score 4/3/2/1 by reach time.
+  The original's blocks/repetitions and "blind" trials are not reproduced.
 
 The session timer starts when the centre (first goal) is reached for the
 first time. The session ends when the sequence is over or after --max-minutes
@@ -32,6 +31,7 @@ Keys: Q / ESC = abort (results so far are still saved).
 """
 
 import argparse
+import collections
 import csv
 import datetime
 import json
@@ -58,16 +58,12 @@ TGT_RADIUS = 40
 GRID_COLS, GRID_ROWS = 6, 3
 TARGET_MARGIN = TGT_RADIUS + 10   # keep targets fully on screen
 TARGET_SEED = 20
+# The generated positions are frozen in this file (versioned with the code):
+# it is what every session actually uses, so the sequence can never drift.
+TARGETS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "config", "cursor_targets.csv")
 
-# --- Sequence (markerlessBoMI reaching.py, "from c# Baseform") ---
-TOT_BLOCKS = 11
-TOT_REPETITIONS = [1, 7, 7, 7, 7, 1, 7, 7, 7, 7, 1]
-TOT_TARGETS = [8, 4, 4, 4, 4, 8, 4, 4, 4, 4, 8]
-# Center-out everywhere: every target is followed by a return to the centre.
-# (The original runs blocks 2-5 and 7-10 as "random walk", never going home:
-#  put them back here to reproduce that.)
-RANDOM_WALK_BLOCKS = ()
-ORDER_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "config", "circle_coadapt.txt")
+# --- Sequence ---
+N_TARGETS = 248   # as many as the original's 11 blocks (8+28+28+28+28+8+28+28+28+28+8)
 
 # --- Timing (markerlessBoMI reaching_functions.py) ---
 DWELL_S = 1.0            # cursor must stay inside the target this long (original: 250 ms)
@@ -98,16 +94,11 @@ REACHED_FLASH_S = 0.25   # target filled green for this long after a reach
 # Target ring: green, blue while the cursor is inside, filled green once reached.
 
 
-def load_order() -> list:
-    with open(ORDER_FILE, "r", encoding="utf-8") as f:
-        return [int(v) for v in f.read().split()]
-
-
-def target_positions(n_targets: int, seed: int = TARGET_SEED) -> list:
+def generate_target_positions(n_targets: int, seed: int = TARGET_SEED) -> list:
     """n_targets (cell, x, y) spread over the canvas: cells of a
     GRID_COLS x GRID_ROWS grid in seeded random order (every cell once before
     any cell repeats), a uniformly random point inside each cell, never the
-    same cell twice in a row."""
+    same cell twice in a row. Only used to create TARGETS_FILE once."""
     rng = np.random.default_rng(seed)
     cell_w = (CANVAS_W - 2 * TARGET_MARGIN) / GRID_COLS
     cell_h = (CANVAS_H - 2 * TARGET_MARGIN) / GRID_ROWS
@@ -128,54 +119,36 @@ def target_positions(n_targets: int, seed: int = TARGET_SEED) -> list:
     return out
 
 
-def build_trials(order: list) -> list:
-    """Flat list of goals, replaying the bookkeeping of markerlessBoMI's
-    reaching_functions.set_target_reaching / check_time_reaching: each block
-    starts with the home target (screen centre); center-out blocks then
-    alternate target -> home, random-walk blocks chain targets without going
-    home. Target positions come from target_positions() (whole canvas) rather
-    than the original circle; `order` only sets how many targets there are.
-    Each entry: kind, block, repetition, index (grid cell), x, y (canvas px)."""
+def target_positions(n_targets: int = N_TARGETS) -> list:
+    """The fixed list of (cell, x, y) targets, read from TARGETS_FILE so that
+    every participant and every launch -- on any machine, with any NumPy
+    version -- gets exactly the same sequence. The file is created once from
+    generate_target_positions() if it does not exist (delete it to regenerate)."""
+    if not os.path.exists(TARGETS_FILE):
+        positions = generate_target_positions(n_targets)
+        with open(TARGETS_FILE, "w", newline="", encoding="utf-8") as f:
+            w = csv.writer(f)
+            w.writerow(["target_number", "cell", "x", "y"])
+            w.writerows((k, cell, f"{x:.3f}", f"{y:.3f}") for k, (cell, x, y) in enumerate(positions, start=1))
+        print(f"[targets] generated {n_targets} target positions -> {TARGETS_FILE} (commit this file)")
+    with open(TARGETS_FILE, newline="", encoding="utf-8") as f:
+        rows = list(csv.DictReader(f))
+    if len(rows) < n_targets:
+        raise ValueError(f"{TARGETS_FILE} has {len(rows)} targets, {n_targets} needed: delete it to regenerate")
+    return [(int(r["cell"]), float(r["x"]), float(r["y"])) for r in rows[:n_targets]]
+
+
+def build_trials() -> list:
+    """Flat list of goals: centre -> target -> centre -> target ..., the
+    N_TARGETS targets from target_positions() (whole canvas). Each entry:
+    kind, target_number (1..N_TARGETS, the target this goal belongs to),
+    index (grid cell, -1 = centre), x, y (canvas px)."""
     cx, cy = CANVAS_W / 2.0, CANVAS_H / 2.0
-    n_total = sum(r * n for r, n in zip(TOT_REPETITIONS, TOT_TARGETS))
-    positions = target_positions(n_total)
     trials = []
-    block, repetition, trial, target, comeback = 1, 1, 1, 0, 1
-    while True:
-        n = TOT_TARGETS[block - 1]
-        if comeback:
-            trials.append({"kind": "home", "block": block, "repetition": repetition, "index": -1, "x": cx, "y": cy})
-        else:
-            cell, x, y = positions[(trial - 1) % len(positions)]
-            trials.append({"kind": "target", "block": block, "repetition": repetition, "index": cell, "x": x, "y": y})
-        # --- what happens once that goal is reached ---
-        if block in RANDOM_WALK_BLOCKS:
-            if comeback == 0:
-                if target == n - 1:
-                    target = 0
-                    repetition += 1
-                else:
-                    target += 1
-                trial += 1
-            else:
-                comeback = 0
-        else:
-            if comeback == 0:
-                comeback = 1
-                target += 1
-                if target == n:
-                    target = 0
-                    repetition += 1
-                    trial += 1
-            else:
-                comeback = 0
-                if target != 0:
-                    trial += 1
-        if repetition > TOT_REPETITIONS[block - 1]:
-            target, comeback, repetition = 0, 1, 1
-            if block == TOT_BLOCKS:
-                return trials
-            block += 1
+    for k, (cell, x, y) in enumerate(target_positions(N_TARGETS), start=1):
+        trials.append({"kind": "home", "target_number": k, "index": -1, "x": cx, "y": cy})
+        trials.append({"kind": "target", "target_number": k, "index": cell, "x": x, "y": y})
+    return trials
 
 
 def session_name(subject: str, sequence: str, results_dir: str) -> str:
@@ -198,7 +171,7 @@ class ReachingCursorTest:
         reuse the whole test with a different goal sequence and output folder."""
         self.subject = subject
         self.max_seconds = max_minutes * 60.0
-        self.trials = trials if trials is not None else build_trials(load_order())
+        self.trials = trials if trials is not None else build_trials()
         self.sequence = sequence
         self.results = []
         self.score = 0
@@ -284,8 +257,8 @@ class ReachingCursorTest:
             MOTION_ONSET_SPEED, SPEED_PEAK_THRESHOLD, RESAMPLE_HZ,
         )
         self.results.append({
-            "trial": self.trial_i + 1, "kind": self.trial["kind"], "block": self.trial["block"],
-            "repetition": self.trial["repetition"], "index": self.trial["index"],
+            "trial": self.trial_i + 1, "kind": self.trial["kind"],
+            "target_number": self.trial["target_number"], "index": self.trial["index"],
             "target_x": self.trial["x"], "target_y": self.trial["y"],
             "success": success, "end_reason": reason, "points": points, "score": self.score,
             "t_shown": self.t_shown - self.t0(), "t_end": t - self.t0(),
@@ -298,6 +271,22 @@ class ReachingCursorTest:
         reason = reason or self.end_reason or "aborted"
         if self.trial is not None and self.trial_i < len(self.trials) and reason != "completed":
             self._record_trial(t, success=False, reason=reason)
+        # One entry per missed target (same position = same target, e.g. the
+        # centre), with a counter of how many times it was missed and in which trials
+        missed = collections.OrderedDict()
+        for r in self.results:
+            if r["success"]:
+                continue
+            key = (r["target_x"], r["target_y"])
+            if key not in missed:
+                missed[key] = {"kind": r["kind"], "cell": r["index"],
+                               "x": round(r["target_x"], 1), "y": round(r["target_y"], 1),
+                               "times_missed": 0, "trials": [], "reasons": []}
+            missed[key]["times_missed"] += 1
+            missed[key]["trials"].append(r["trial"])
+            missed[key]["reasons"].append(r["end_reason"])
+        missed_by_cell = collections.Counter(r["index"] for r in self.results if not r["success"])
+        shown_by_cell = collections.Counter(r["index"] for r in self.results)
         summary = {
             "subject": self.subject, "sequence": self.sequence, "end_reason": reason,
             "n_trials_total": len(self.trials),
@@ -305,18 +294,21 @@ class ReachingCursorTest:
             "timestamp": self.timestamp,
             "score": self.score,
             **summarize(self.results),
-            # Which targets were not reached: trial number, grid cell (-1 = centre),
-            # canvas position and why (trial_timeout / session_timeout / aborted)
-            "missed_targets": [
-                {"trial": r["trial"], "kind": r["kind"], "cell": r["index"], "block": r["block"],
-                 "x": round(r["target_x"], 1), "y": round(r["target_y"], 1), "reason": r["end_reason"]}
-                for r in self.results if not r["success"]
-            ],
+            # Which targets were not reached: grid cell (-1 = centre), canvas
+            # position, how many times it was missed, in which trials and why
+            # (trial_timeout / session_timeout / aborted)
+            "missed_targets": list(missed.values()),
+            # Misses per grid cell (-1 = centre): how many goals in that cell were
+            # shown and how many of them were missed
+            "missed_by_cell": {
+                str(cell): {"presented": shown_by_cell[cell], "missed": missed_by_cell.get(cell, 0)}
+                for cell in sorted(missed_by_cell)
+            },
             "config": {
                 "canvas": [CANVAS_W, CANVAS_H], "crs_radius": CRS_RADIUS, "tgt_radius": TGT_RADIUS,
                 "grid": [GRID_COLS, GRID_ROWS], "target_seed": TARGET_SEED,
                 "dwell_s": DWELL_S, "max_seconds": self.max_seconds,
-                "tot_repetitions": TOT_REPETITIONS, "tot_targets": TOT_TARGETS,
+                "n_targets": N_TARGETS,
                 "motion_onset_speed": MOTION_ONSET_SPEED, "speed_peak_threshold": SPEED_PEAK_THRESHOLD,
             },
         }
@@ -417,7 +409,7 @@ def main(build=build_trials, results_dir: str = RESULTS_DIR, sequence: str = "ce
         )
     )
 
-    test = ReachingCursorTest(args.subject, args.max_minutes, trials=build(load_order()),
+    test = ReachingCursorTest(args.subject, args.max_minutes, trials=build(),
                               results_dir=results_dir, sequence=sequence)
     screen = Screen(title=f"BoMI - Reaching ({sequence})")
     cursor_filter = bomi.CursorFilter()
@@ -449,8 +441,8 @@ def main(build=build_trials, results_dir: str = RESULTS_DIR, sequence: str = "ce
     if summary["missed_targets"]:
         print("Missed targets:")
         for m in summary["missed_targets"]:
-            print(f"  trial {m['trial']:3d}  {m['kind']:6s} cell {m['cell']:2d}  at ({m['x']:.0f}, {m['y']:.0f})  [{m['reason']}]")
-    print(f"Results: {test.base}_trials.csv / _summary.json")
+            print(f"  {m['kind']:6s} cell {m['cell']:2d}  at ({m['x']:.0f}, {m['y']:.0f})  missed {m['times_missed']}x "
+                  f"(trials {m['trials']}, {', '.join(sorted(set(m['reasons'])))})")
 
 
 if __name__ == "__main__":
