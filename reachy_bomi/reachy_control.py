@@ -556,6 +556,13 @@ def teleop_with_grasp_switch(cap, landmarker, bomi_map, mobile_base, depth_cam, 
           f"for {SELECTION_HOLD_SECONDS:.0f}s to move to the pre-grasping pose")
 
     while True:
+        # A quit watcher fires on its own thread and starts the shutdown --
+        # including rotate_base_once's blocking translate/rotate -- while
+        # this loop is still running. Bail out before publishing anything
+        # else, or those speed commands fight the rotation.
+        if safety.shutdown_started():
+            return
+
         hand_frame, crs_x, crs_y, hand_detected = bomi_teleop.update_bomi_cursor(
             cap, landmarker, bomi_map, cursor_filter, crs_x, crs_y,
         )
@@ -676,9 +683,13 @@ def teleop_with_grasp_switch(cap, landmarker, bomi_map, mobile_base, depth_cam, 
         if safety.quit_requested(key, map_window):
             break
 
-    mobile_base.set_goal_speed(vx=0, vy=0, vtheta=0)
-    mobile_base.send_speed_command()
-    mobile_base.turn_off()
+    # Skipped during a shutdown: safe_robot_shutdown already zeroed the
+    # speed, and turning the base off here would cut rotate_base_once's
+    # rotation short on the watcher's thread.
+    if not safety.shutdown_started():
+        mobile_base.set_goal_speed(vx=0, vy=0, vtheta=0)
+        mobile_base.send_speed_command()
+        mobile_base.turn_off()
     safety.destroy_window(map_window)
     stop_camera_viewer()  # no-op if already stopped (Phase 4 switch stops it itself)
 
@@ -714,6 +725,12 @@ def repositioning_navigation(cap, landmarker, bomi_map, cursor_filter, crs_x, cr
         center_hold_start = None
 
         while True:
+            # Same reason as in teleop_with_grasp_switch: a quit watcher can
+            # already be mid-shutdown on another thread, and anything
+            # published here would fight its base rotation.
+            if safety.shutdown_started():
+                return crs_x, crs_y, True
+
             _, crs_x, crs_y, hand_detected = bomi_teleop.update_bomi_cursor(
                 cap, landmarker, bomi_map, cursor_filter, crs_x, crs_y,
             )

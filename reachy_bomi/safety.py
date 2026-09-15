@@ -32,6 +32,19 @@ _wmctrl_missing_warned = False
 _rotation_lock = threading.Lock()
 _rotation_done = False
 
+_shutdown_started = threading.Event()
+
+
+def shutdown_started() -> bool:
+    """True once safe_robot_shutdown has begun, on any thread. The quit
+    watchers call it from their own threads while the teleop loops are still
+    running on the main one, so those loops must stop commanding the base the
+    moment this goes True: rotate_base_once's translate/rotate block for
+    seconds, and speed commands published on top of them fight the rotation
+    (an ESC pressed with the cursor off-center is actively commanding a spin)
+    -- which is how a deliberate 180 deg turn ends up overshooting."""
+    return _shutdown_started.is_set()
+
 
 def rotate_base_once(mobile_base, reverse_cm: float = SHUTDOWN_REVERSE_CM) -> None:
     """Translate back + rotate SHUTDOWN_ROTATION_DEG, but only the first time
@@ -188,7 +201,13 @@ def safe_robot_shutdown(reachy: ReachySDK, mobile_base=None, rotate_base_before_
     then rotates it SHUTDOWN_ROTATION_DEG in place first, via rotate_base_once
     (so it never double-fires against a concurrent wind-down rotation) -- pass
     this whenever the robot may be sitting close to a table with its arms
-    about to fold in, so they don't fold into it."""
+    about to fold in, so they don't fold into it.
+
+    Flips shutdown_started() first thing, before anything moves, so the
+    teleop loops still running on the main thread stop publishing speed
+    commands that would otherwise fight the rotation below."""
+    _shutdown_started.set()
+
     if mobile_base is not None:
         try:
             mobile_base.set_goal_speed(vx=0, vy=0, vtheta=0)

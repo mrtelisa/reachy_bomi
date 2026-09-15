@@ -60,6 +60,13 @@ def wait_for_pre_grasp_pose(cap, landmarker, bomi_map, cursor_filter, crs_x, crs
     start = time.time()
 
     while True:
+        # A quit watcher may already be shutting down on its own thread,
+        # with rotate_base_once's rotation under way -- the zero goal speed
+        # published below would stop that rotation dead.
+        if safety.shutdown_started():
+            safety.destroy_window(WAIT_WINDOW_NAME)
+            return crs_x, crs_y, True
+
         _, crs_x, crs_y, _ = bomi_teleop.update_bomi_cursor(cap, landmarker, bomi_map, cursor_filter, crs_x, crs_y)
 
         progress = min((time.time() - start) / PRE_GRASP_MOVE_DURATION, 1.0)
