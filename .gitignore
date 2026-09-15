@@ -5,10 +5,7 @@ build/
 install/
 log/
 *.npz
-File_BoMI_Naji/
 *.png
-reachy_bomi/tests/
-markerlessBoMI_FaMa-main/
 # Cursor reaching test outputs (reaching_center_out.py / reaching_random.py)
 results_center_out/
 results_random/

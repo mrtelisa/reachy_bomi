@@ -10,7 +10,7 @@ This work started from a ROS 1 implementation written for the TIAGo robot and wa
 
 ## How it works
 
-The system is **distributed across two machines**:
+The system is split in two sides, **operator** and **robot**. They can be two machines, or -- for the simulation -- one PC where the robot side runs inside the Reachy Docker container (see [Single PC with Docker](#single-pc-with-docker)):
 
 ```
   OPERATOR PC                          ROBOT / SIMULATION PC
@@ -30,7 +30,7 @@ The system is **distributed across two machines**:
 3. **`cmd_vel_publisher.py`** (ROS 2 node, started by `bomi_control.launch.py`) subscribes to those topics and, while the base is in velocity mode (`base_state == 1.0`), publishes a `geometry_msgs/Twist` on `/cmd_vel`.
 4. **`bomi_control.launch.py`** starts the **Reachy simulation in Gazebo** (via `reachy_bringup`) with the world chosen by the selected scenario, `cmd_vel_publisher`, and (optionally) records a **ROS 2 bag** of the run. It can also be launched manually on the robot PC instead of being triggered remotely — see [Usage](#usage).
 
-The **velocity computation does not depend on the scenario** — the scenario only selects which Gazebo world (obstacles) is loaded. See [Scenarios](#scenarios).
+The **velocity computation does not depend on the scenario** — the scenario selects the Gazebo world and, for `reaching`, starts the reaching task node. See [Scenarios](#scenarios).
 
 ---
 
@@ -38,16 +38,16 @@ The **velocity computation does not depend on the scenario** — the scenario on
 
 **Robot / simulation side (ROS 2):**
 
-- ROS 2 (with `rclpy`, `std_msgs`, `geometry_msgs`)
-- [`reachy_bringup`](https://github.com/pollen-robotics) and `reachy_utils` (provide `reachy.launch.py` and the Gazebo simulation)
-- Gazebo
+- ROS 2 Humble (with `rclpy`, `std_msgs`, `geometry_msgs`, `nav_msgs`, `gazebo_msgs`), `numpy`, `scipy`, `pyyaml`
+- Pollen's `reachy2_core` stack (`reachy_bringup`, `reachy_gazebo`, `zuuu_hal`, ...) and Gazebo Classic 11
 
-**...or** just download the docker image pollenrobotics/reachy2 and create a container
+**...or** just use the Pollen Docker image (`pollenrobotics/reachy2`), which ships all of the above: it is what the simulation experiments run in, see [Single PC with Docker](#single-pc-with-docker).
 
 **Operator PC (client, plain Python — no ROS required):**
 
 ```bash
 pip install mediapipe opencv-python tensorflow numpy scipy
+sudo apt install wmctrl   # optional: keeps the cursor map above the browser window
 ```
 If necessary, create a virtual environment.
 
@@ -58,7 +58,7 @@ curl -o scripts/hand_landmarker.task \
   https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/latest/hand_landmarker.task
 ```
 
-Both machines must be on the **same network** and able to reach each other on the TCP port (default `5051`).
+With two machines, both must be on the **same network** and able to reach each other on the TCP port (default `5051`).
 
 ---
 
@@ -77,6 +77,27 @@ source install/setup.bash
 ---
 
 ## Usage
+
+### Single PC with Docker
+
+The host runs the client (Ubuntu 24.04 / ROS Jazzy, or no ROS at all); the whole robot side runs in a container created from the Pollen image, which has ROS Humble and Gazebo Classic (not available natively on Ubuntu 24.04). The TCP socket makes the ROS version mismatch irrelevant.
+
+```bash
+# once: create the container (the repo is mounted, so the code inside is always the host's)
+docker run -it --name reachy_sim -p 6080:6080 \
+  -v ~/Desktop/Tesi/Code/reachy_bomi:/home/reachy/reachy_ws/src/reachy_bomi \
+  reachy_completo:latest            # or pollenrobotics/reachy2:latest
+
+# every session: open a shell in the container, build once, start the bridge
+docker exec -it reachy_sim bash
+source /opt/ros/humble/setup.bash && source ~/reachy_ws/install/setup.bash
+cd ~/reachy_ws && colcon build --packages-select reachy_bomi --symlink-install && source install/setup.bash
+ros2 launch reachy_bomi bomi_bridge.launch.py      # prints "Socket server listening on 172.17.0.2:5051"
+```
+
+Then run the client on the host with the container's IP (`172.17.0.2` on the default Docker bridge). Gazebo is shown through the container's noVNC page (`http://localhost:6080/vnc.html?autoconnect=1&resize=remote`), which the client opens by itself. Bags and reaching results land in `~/reachy_bomi_bags/` **inside the container**.
+
+[`scripts/container_tweaks.sh`](scripts/container_tweaks.sh) contains the changes to Pollen's stack that the experiments rely on (lidar rays not drawn, simulated cameras shrunk to save CPU); re-apply it whenever the container is recreated from the image (instructions in the file). If the container was created without the `-v` mount, copy the changed files in with `docker cp` and rebuild.
 
 ### 1. On the robot / simulation PC — start the bridge (once)
 
@@ -97,7 +118,7 @@ Launch arguments:
 | Argument     | Default           | Description                                              |
 |--------------|-------------------|-----------------------------------------------------------|
 | `scenario`   | `familiarization` | Scenario to run (selects the Gazebo world). See below.       |
-| `start_rviz` | `true`            | Whether to start RViz (`true` / `false`).                    |
+| `start_rviz` | `true`            | Whether to start RViz (`true` / `false`). The client sends `false` by default. |
 | `record`     | `true`            | Whether to record a ROS 2 bag of the run (`true` / `false`). |
 
 ### 2. On the operator PC — run the hand-tracking client
@@ -106,11 +127,11 @@ Launch arguments:
 # First time (or to recalibrate): run the calibration phase and save it
 python3 socket_client.py <robot_ip> --calibrate [--calib bomi_calib.npz] [--model scripts/hand_landmarker.task] \
     [--port 5051] [--cam 0] \
-    [--scenario familiarization] [--start-rviz true] [--record true] [--sim-wait 18] [--sim-url URL] [--show-cam]
+    [--scenario familiarization] [--start-rviz false] [--record true] [--sim-wait 10] [--sim-url URL] [--show-cam]
 
 # Next times: load the saved calibration, skip straight to control
 python3 socket_client.py <robot_ip> [--model scripts/hand_landmarker.task] [--port 5051] [--cam 0] \
-    [--scenario familiarization] [--start-rviz true] [--record true] [--sim-wait 18] [--sim-url URL] [--show-cam]
+    [--scenario familiarization] [--start-rviz false] [--record true] [--sim-wait 10] [--sim-url URL] [--show-cam]
 ```
 
 `<robot_ip>` is optional if you've set `DEFAULT_HOST` in `socket_client.py` to your robot's IP; otherwise pass it explicitly. If `--scenario` is given, the client sends `scenario:<name> rviz:<start_rviz> record:<record>` to the bridge right after connecting, opens the simulation view (`--sim-url`, by default the noVNC page served by the Reachy container on `http://localhost:6080`) in the default browser, waits `--sim-wait` seconds for the simulation to come up, and only then starts calibration/control. If `--scenario` is omitted, no scenario request is sent (useful when a scenario is already running, e.g. launched manually per step 1).
@@ -122,7 +143,7 @@ python3 socket_client.py <robot_ip> [--model scripts/hand_landmarker.task] [--po
 
 **Phase 2 — Cursor preview:** the cursor map is shown but nothing is sent to the robot, so you can get a feel for the cursor. Hold it in the centre region (5) for 5 s to start Control.
 
-**Phase 3 — Control:** your hand drives the cursor; the cursor position is mapped to base velocities and streamed to the robot. A small map of the virtual screen with the 9-region grid lines and a dot at the current cursor position is shown, pinned to the top-left corner of the screen and kept above the browser window with the simulation (`wmctrl` recommended: `sudo apt install wmctrl`). Add `--show-cam` to also see the webcam feed with the hand landmarks. Press `Q`/`Esc`, or close the window, to stop the robot and quit.
+**Phase 3 — Control:** your hand drives the cursor; the cursor position is mapped to base velocities and streamed to the robot. In the `reaching` scenario the map also shows the task progress (`target 4/60`) in blue at the bottom, and the client exits by itself when the task is over. A small map of the virtual screen with the 9-region grid lines and a dot at the current cursor position is shown, pinned to the top-left corner of the screen and kept above the browser window with the simulation (`wmctrl` recommended: `sudo apt install wmctrl`). Add `--show-cam` to also see the webcam feed with the hand landmarks. Press `Q`/`Esc`, or close the window, to stop the robot and quit.
 
 The control area is a 3×3 grid with a dead zone in the centre:
 
@@ -132,6 +153,18 @@ The control area is a 3×3 grid with a dead zone in the centre:
  7 | 8 | 9      middle row (4,6)    → angular only
                 corners (1,3,7,9)   → linear + angular
 ```
+
+### Calibration tools (operator PC, no robot needed)
+
+Besides `--calibrate` in the client, three standalone tools in `reachy_bomi/` manage calibrations without connecting to anything (same webcam/MediaPipe chain, same `calibrations/` folder; names can be given without `.npz`):
+
+```bash
+python3 calibrate_bomi.py                 # calibrate, preview the cursor, S = save under a name
+python3 customize_bomi.py <name>          # rotate / flip / scale / offset a saved map live, S = save as a new name
+python3 load_bomi.py <name>               # try a saved calibration on the cursor map
+```
+
+The same calibration file is used by the client (`--calib <name>`), by the robot reaching task and by the cursor reaching tests.
 
 ---
 
@@ -147,7 +180,7 @@ How it runs ([`reachy_bomi/reaching_task.py`](reachy_bomi/reaching_task.py), sta
 
 1. Gazebo loads `worlds/reaching.world`: an empty room with two floor markers (white disc = home, green disc = current target; visual only, no collision).
 2. The node waits for the operator to finish the **cursor preview**: as soon as control starts, the **session timer** (`session_duration`, default 5 min) starts and the first target appears.
-3. A target is reached when the base centre stays within `target_radius` (0.35 m) for `dwell_time` (2 s); one not reached within `trial_timeout` (30 s) is missed and the next one is shown. The cursor map shows the progress (`target 4/32`) in blue at the bottom.
+3. A target is reached when the base centre stays within `target_radius` (0.35 m) for `dwell_time` (2 s); one not reached within `trial_timeout` (30 s) is missed and the next one is shown. The cursor map shows the progress (`target 4/60`) in blue at the bottom.
 4. When all targets are done **or the session time is up**, the node exits and the launch shuts everything down (Gazebo, `cmd_vel_publisher`, bag); the client stops on its own.
 
 Per-trial metrics are computed from `/odom` and recorded both in the bag (`/reaching/trial_result`, JSON) and in `~/reachy_bomi_bags/Reaching_<timestamp>_reaching.csv` (+ a `_summary.json`):
@@ -184,16 +217,12 @@ Common to both: 1200x650 canvas scaled to the screen (the map's 2550x1500 space 
 
 ## Scenarios
 
-Scenarios are defined in [`config/scenarios.yaml`](config/scenarios.yaml). Each one maps a name to a `map_id`, a Gazebo `world`, and a `bag_prefix` used to name the recording.
+Scenarios are defined in [`config/scenarios.yaml`](config/scenarios.yaml): each maps a name to a Gazebo `world`, a `bag_prefix` used to name the recording and, optionally, a `task`.
 
-| Scenario        | World                  |
-|-----------------|------------------------|
-| `familiarization` | `familiarization.world` |
-| `train1`–`train4` | `labyrinth1.world`     |
-| `test1`, `test2`  | `mid_tests.world`      |
-| `train5`–`train8` | `labyrinth2.world`     |
-| `reaching`      | `reaching.world` (center-out reaching task, see above) |
-| `final_test`      | `final_test.world`     |
+| Scenario          | World                   | What happens |
+|-------------------|-------------------------|--------------|
+| `familiarization` | `familiarization.world` | free driving: the participant moves the robot around a room with a few obstacles |
+| `reaching`        | `reaching.world`        | center-out reaching task with the mobile base (see [Reaching task](#reaching-task)) |
 
 ---
 
@@ -202,49 +231,37 @@ Scenarios are defined in [`config/scenarios.yaml`](config/scenarios.yaml). Each 
 ```
 reachy_bomi/
 ├── reachy_bomi/                    # ROS 2 Python package
-│   ├── __init__.py
-│   ├── socket_client.py            # operator-side client (MediaPipe → socket)
-│   ├── socket_server.py            # ROS 2 node: socket → ROS topics
+│   ├── socket_client.py            # operator-side client (MediaPipe → cursor → socket)
+│   ├── socket_server.py            # ROS 2 node: socket → ROS topics (bridge)
 │   ├── cmd_vel_publisher.py        # ROS 2 node: ROS topics → /cmd_vel
-│   └── scenarios.py                # loads scenarios.yaml, resolves worlds
+│   ├── reaching_task.py            # ROS 2 node: center-out reaching task with the robot
+│   ├── reaching_center_out.py      # fullscreen cursor reaching test, center-out (no robot)
+│   ├── reaching_random.py          # fullscreen cursor reaching test, random sequence (no robot)
+│   ├── reaching_metrics.py         # per-trial kinematic metrics shared by the reaching tests
+│   ├── calibrate_bomi.py           # standalone tools: create / customize / try a calibration
+│   ├── customize_bomi.py
+│   ├── load_bomi.py
+│   └── scenarios.py                # loads scenarios.yaml
 ├── config/
-│   └── scenarios.yaml              # scenario definitions
+│   ├── scenarios.yaml              # scenario definitions
+│   ├── reaching.yaml               # robot reaching task parameters
+│   └── cursor_targets.csv          # frozen target positions of the cursor reaching tests
 ├── launch/
 │   ├── bomi_bridge.launch.py       # persistent socket_server bridge (start once)
-│   └── bomi_control.launch.py      # simulation + cmd_vel_publisher + bag recording
-├── scripts/                        # offline analysis tools (not part of runtime)
-│   ├── extract_path.py
-│   ├── trajectory_map_collisions.py
-│   ├── export_collision_events_csv.py
-│   └── hand_landmarker.task        # MediaPipe model (download separately, see Requirements)
-├── worlds/                         # Gazebo world files
-├── resource/
-│   └── reachy_bomi                 # ament resource marker
-├── package.xml
-├── setup.py
-├── setup.cfg
-├── .gitignore
+│   └── bomi_control.launch.py      # simulation + cmd_vel_publisher (+ reaching_task) + bag recording
+├── worlds/
+│   ├── familiarization.world
+│   └── reaching.world
+├── scripts/
+│   ├── hand_landmarker.task        # MediaPipe model (download separately, see Requirements)
+│   └── container_tweaks.sh         # tweaks to re-apply inside the Reachy Docker container
+├── calibrations/                   # saved hand-to-cursor calibrations (.npz, not versioned)
+├── resource/reachy_bomi            # ament resource marker
+├── package.xml, setup.py, setup.cfg
 └── README.md
 ```
 
-### Offline analysis scripts
-
-The tools in `scripts/` inspect a recorded bag **after** a run; they are standalone and not part of the runtime flow:
-
-- `extract_path.py` — export the robot path from a bag to CSV.
-- `trajectory_map_collisions.py` — plot the trajectory (and collisions, if available).
-- `export_collision_events_csv.py` — export collision events to CSV.
-
-Collisions are estimated using the `/scan` topic.
-
-Run them directly, e.g.:
-
-```bash
-python3 scripts/extract_path.py ~/reachy_bomi_bags/Familiarization_<timestamp> path.csv
-```
-
-## TODOs
-- Evaluate if it makes sense to implement a mechanism of collision evaluation using the `/odom` topic together with the `/scan` one 
-
 ## Known limitations
 - The client and the robot side must be reachable on the same network; there is no automatic discovery — you pass the robot IP to the client manually.
+- `socket_server` binds to the machine's network IP (not `0.0.0.0`): connect to the address it prints, and the machine needs a default route.
+- In the container Gazebo and its GUI are software-rendered (no GPU): the simulation is CPU-heavy and the robot's motion can look choppy. The base velocity goes through Pollen's `zuuu_hal`, which caps it at 0.61 m/s.

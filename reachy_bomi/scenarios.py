@@ -17,8 +17,6 @@ def load_scenarios_config():
 
 _scenarios = load_scenarios_config()
 
-# Derived from scenarios.yaml — map_id is the authoritative source
-SCENARIO_IDS = {name: cfg["map_id"] for name, cfg in _scenarios.items()}
 SCENARIO_NAMES = tuple(_scenarios.keys())
 
 
