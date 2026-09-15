@@ -23,7 +23,7 @@ GRIPPER_MAX_OPENING_M = 0.1 # [m], parallel gripper's max fingertip opening
 PREGRASP_STANDOFF_M = 0.10
 
 # How far straight up the arm lifts once the gripper has closed 
-GRASP_LIFT_M = 0.10
+GRASP_LIFT_M = 0.15
 
 ARM_GOTO_DURATION_S = 3.0 
 
@@ -39,7 +39,7 @@ _GRASP_APPROACH_MARGIN_BY_ARM = {"r_arm": GRASP_APPROACH_MARGIN_DX_M, "l_arm": G
 # grasp height lands a bit lower than intended (object slip in the gripper
 # during transit and/or arm sag under the object's weight) -- release this
 # much higher instead. TODO: find the right value / whether it's per-arm too
-PLACE_HEIGHT_MARGIN_M = 0.009
+PLACE_HEIGHT_MARGIN_M = 0.007
 
 # Fallback "up" direction (Reachy world frame) when the table plane fit fails 
 DEFAULT_TABLE_NORMAL: npt.NDArray[np.float64] = np.array([0.0, 0.0, 1.0])
@@ -54,6 +54,15 @@ GRASP_HEIGHT_FRACTION = 3 / 5
 
 # How many horizontal approach directions is_roughly_reachable tries
 QUICK_REACHABILITY_CANDIDATE_COUNT = 8
+
+# Horizontal distance from the robot's base axis past which no arm can
+# reach, used by plan_place to reject a target outright instead of running
+# an IK search that would certainly fail. Deliberately generous, well past
+# what the arm can actually do: too large only wastes a little time on
+# hopeless poses, while too small would wrongly refuse a reachable one.
+# Measured in the XY plane rather than in 3D, so however high the base frame
+# sits above the floor doesn't enter into it.
+MAX_REACH_XY_M = 1.0
 
 
 class ObjectGeometry(NamedTuple):
@@ -338,8 +347,9 @@ def plan_place(
         withdraw along without dragging/knocking it.
 
     Returns None (silently -- _build_place_grid calls this once per grid
-    cell) if no orientation puts all three poses within reach of
-    plan.arm_name, so the caller can ask the user for a different point."""
+    cell) if target_point is past MAX_REACH_XY_M, or if no orientation puts
+    all three poses within reach of plan.arm_name, so the caller can ask the
+    user for a different point."""
     arm = getattr(reachy, plan.arm_name, None)
     if arm is None:
         return None
@@ -353,6 +363,14 @@ def plan_place(
 
     transit_position = target_inplane + normal * lift_height
     place_position = target_inplane + normal * grasp_height
+
+    # Geometric reject before any IK. _build_place_grid calls this once per
+    # cell, and a cell nothing can serve otherwise burns the whole
+    # candidate_count x 3 search, per arm -- roughly 16x what a cell that
+    # succeeds on its first candidate costs. Most of those are background
+    # (wall, floor) metres out, which this rules out for free.
+    if np.linalg.norm(place_position[:2]) > MAX_REACH_XY_M:
+        return None
 
     # -grasp_matrix's local z is the approach it was built from
     # (_orientation_from_approach), so this re-derives the current orientation

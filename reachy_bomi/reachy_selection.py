@@ -51,7 +51,7 @@ PLACE_HOVER_SECONDS = DWELL_HOLD_SECONDS
 # screen terms, at a typical distance); small enough that the placement still
 # lands close to where the user pointed. Tune this first if cells feel too
 # coarse or too fiddly on the real robot.
-PLACE_GRID_CELL_SIZE_M = 0.07
+PLACE_GRID_CELL_SIZE_M = 0.12
 
 # Every PLACE_GRID_SAMPLE_STRIDE_PXth pixel (in each axis) is classified into
 # a table-plane cell, instead of every pixel -- table cells are big enough
