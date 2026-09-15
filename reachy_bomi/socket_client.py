@@ -41,7 +41,7 @@ Phase 1 - Calibration (only with --calibrate):
     SPACE = record sample   |   ENTER = finish (min 30 samples required)
 
 Phase 2 - Control:
-    Hand movement -> PCA cursor -> 9-region velocity -> TCP socket to robot.
+    Hand movement -> autoencoder cursor -> 9-region velocity -> TCP socket to robot.
     Opens two windows: the webcam feed with landmarks, and a map of the
     virtual screen with the 9-region grid lines and a dot at the current
     cursor position.
@@ -54,6 +54,8 @@ import socket
 import sys
 import time
 
+os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "2")
+
 import cv2
 import mediapipe as mp
 import numpy as np
@@ -61,7 +63,11 @@ import scipy.signal as sgn
 from mediapipe.tasks.python.core import base_options
 from mediapipe.tasks.python.vision import hand_landmarker
 from mediapipe.tasks.python.vision.core import vision_task_running_mode
-from sklearn.decomposition import PCA
+# from sklearn.decomposition import PCA  # PCA map, replaced by the autoencoder below
+import tensorflow as tf
+from tensorflow.keras import Model
+from tensorflow.keras.layers import Dense, Input
+from tensorflow.keras.optimizers import Adam
 
 HAND_CONNECTIONS = hand_landmarker.HandLandmarksConnections.HAND_CONNECTIONS
 
@@ -101,10 +107,19 @@ DEFAULT_MODEL_PATH = os.path.join(
 
 
 def _resolve_calib_path(calib_arg: str) -> str:
-    """Bare filename -> calibrations/ folder; explicit path -> used as given."""
+    """Bare filename -> calibrations/ folder; explicit path -> used as given
+    (.npz appended either way if missing, so 'elisa' -> calibrations/elisa.npz)."""
+    if not calib_arg.endswith(".npz"):
+        calib_arg += ".npz"
     if os.path.dirname(calib_arg):
         return calib_arg
     return os.path.join(CALIB_DIR, calib_arg)
+
+
+# Shared window names, so the standalone calibrate/customize/load tools show
+# the same cursor map window as the control phase.
+CAM_WINDOW_NAME = "BoMI - Control"
+MAP_WINDOW_NAME = "BoMI - Cursor Map"
 
 
 # --- Velocity helpers (adapted from reaching_functions.py) ---------
@@ -186,7 +201,7 @@ def apply_region_velocity_mask(region: int, lin_vel: float, ang_vel: float) -> t
     return lin_vel, ang_vel
 
 
-# --- PCA forward map ---
+# --- Autoencoder forward map ---
 def _extract_hand_features(hand_landmarks, mirror_x: bool = False) -> np.ndarray:
     """
     Flatten all 21 hand landmarks (x, y) into a 42-element vector.
@@ -284,69 +299,217 @@ class CursorFilter:
         return float(new_output[0]), float(new_output[1])
 
 
+# --- Autoencoder forward map parameters ---
+# Same architecture/hyperparameters as Naji's compute_bomi_map.Autoencoder.train_network,
+# as used for dr_mode="ae" in main_reaching_FullHand_MOD_ae.py's train_ae():
+# Input -> Dense(32, tanh) -> Dense(32, tanh) -> Dense(2, linear) [latent/cursor]
+#       -> Dense(32, tanh) -> Dense(32, tanh) -> Dense(n_features, linear) [reconstruction]
+AE_N_STEPS = 3001      # training epochs (n_steps)
+AE_LR = 0.02           # Adam learning rate
+AE_HIDDEN_UNITS = 32   # nh1 = nh2
+AE_ACTIVATION = "tanh"
+AE_SEED = 20
+AE_LATENT_DIM = 2      # cu: 2 code units -> (crs_x, crs_y)
+
+
 class BoMIMap:
     """
-    PCA forward map: raw hand landmarks -> 2D cursor in screen space.
+    Autoencoder forward map: raw hand landmarks -> 2D cursor in screen space.
 
-    PCA(2 components) fitted directly on the raw landmark samples. Scale/offset 
-    map the calibration scores' peak-to-peak range onto the screen size, centered 
-    on the mean.
+    A dense autoencoder is trained on the raw landmark calibration samples
+    (reconstruction loss only, no separate normalization), and its 2-unit
+    latent layer is used standalone as the cursor space at inference time --
+    exactly the dr_mode="ae" path in Naji's BoMI pipeline
+    (compute_bomi_map.Autoencoder.train_network + reaching_functions.get_mapped_values).
+    Scale/offset map the latent codes' peak-to-peak range onto the screen size,
+    centered on the mean, same as train_ae()'s post-training step (with rot=0).
 
-    The fitted parameters (PCA mean, components, scale, offset) are plain numpy
-    arrays, so the map can be saved to / loaded from a .npz file and reused
-    without repeating calibration.
+    The screen-space map is stored as a single affine transform cu_screen = A @
+    cu_latent + b (A starts out diagonal, i.e. plain per-axis scale).
+
+    The fitted parameters (encoder weights/biases, A, b) are plain numpy arrays,
+    so the map can be saved to / loaded from a .npz file and reused without
+    repeating calibration.
     """
 
     def __init__(self) -> None:
-        self._mean = None         # PCA mean (42,)
-        self._components = None   # PCA components (2, 42)
-        self._scale = np.ones(2)
-        self._offset = np.zeros(2)
+        self._w1 = self._b1 = None  # encoder layer 1 (Dense, tanh)
+        self._w2 = self._b2 = None  # encoder layer 2 (Dense, tanh)
+        self._w3 = self._b3 = None  # encoder layer 3 (Dense, linear) -> latent/cursor
+        self._A = np.eye(2)     # latent -> screen affine map (starts diagonal = plain scale)
+        self._b = np.zeros(2)
         self.fitted = False
 
     def fit(self, samples: list) -> None:
-        X = np.array(samples)
+        X = np.array(samples, dtype=np.float32)
+        n_features = X.shape[1]
 
-        pca = PCA(n_components=2)
-        scores = pca.fit_transform(X)
+        tf.keras.backend.clear_session()
+        np.random.seed(AE_SEED)
+        tf.random.set_seed(AE_SEED)
+        initializer = tf.keras.initializers.GlorotNormal(seed=AE_SEED)
 
-        extent = np.ptp(scores, axis=0)
+        inputs = Input(shape=(n_features,))
+        hidden1 = Dense(AE_HIDDEN_UNITS, activation=AE_ACTIVATION, kernel_initializer=initializer)(inputs)
+        hidden1 = Dense(AE_HIDDEN_UNITS, activation=AE_ACTIVATION, kernel_initializer=initializer)(hidden1)
+        latent = Dense(AE_LATENT_DIM, kernel_initializer=initializer)(hidden1)
+        hidden2 = Dense(AE_HIDDEN_UNITS, activation=AE_ACTIVATION, kernel_initializer=initializer)(latent)
+        hidden2 = Dense(AE_HIDDEN_UNITS, activation=AE_ACTIVATION, kernel_initializer=initializer)(hidden2)
+        predictions = Dense(n_features, kernel_initializer=initializer)(hidden2)
+
+        encoder = Model(inputs=inputs, outputs=latent)
+        autoencoder = Model(inputs=inputs, outputs=predictions)
+        autoencoder.compile(loss="mse", optimizer=Adam(learning_rate=AE_LR))
+
+        print(f"Training autoencoder BoMI map ({AE_N_STEPS} epochs)...")
+        autoencoder.fit(x=X, y=X, epochs=AE_N_STEPS, verbose=0, batch_size=len(X), shuffle=False)
+        print("Autoencoder training done.")
+
+        # Keep only the encoder half (first 3 Dense layers) for standalone inference,
+        # same as train_ae() only persisting weights1/2/3 + biases1/2/3.
+        dense_layers = [layer for layer in autoencoder.layers if layer.get_weights()]
+        self._w1, self._b1 = dense_layers[0].get_weights()
+        self._w2, self._b2 = dense_layers[1].get_weights()
+        self._w3, self._b3 = dense_layers[2].get_weights()
+
+        train_cu = encoder.predict(X, verbose=0)
+
+        extent = np.ptp(train_cu, axis=0)
         extent = np.where(extent > 1e-6, extent, 1.0)
 
         screen = np.array([BASE_WIDTH, BASE_HEIGHT], dtype=float)
 
-        # Store the plain arrays needed for inference (decoupled from the sklearn object)
-        self._mean = pca.mean_
-        self._components = pca.components_
-        self._scale = screen / extent
-        self._offset = screen / 2.0 - (scores * self._scale).mean(axis=0)
+        scale = screen / extent
+        self._A = np.diag(scale)
+        self._b = screen / 2.0 - (train_cu * scale).mean(axis=0)
         self.fitted = True
 
     def transform(self, features: np.ndarray) -> tuple:
-        cu = np.dot(features - self._mean, self._components.T)
-        cu = cu * self._scale + self._offset
+        """
+        Autoencoder BoMI map: raw hand landmarks -> 2D cursor in screen space,
+        via the trained encoder's forward pass (2 tanh hidden layers + linear
+        latent layer), same as reaching_functions.get_mapped_values(dr_mode="ae").
+        Returns (crs_x, crs_y) in pixels, clipped to the screen size.
+        """
+        h = np.tanh(np.dot(features, self._w1) + self._b1)
+        h = np.tanh(np.dot(h, self._w2) + self._b2)
+        cu = np.dot(h, self._w3) + self._b3  # latent code == raw cursor position
+        cu = self._A @ cu + self._b  # map latent extent onto the screen size
         crs_x = float(np.clip(cu[0], 0, BASE_WIDTH))
         crs_y = float(np.clip(cu[1], 0, BASE_HEIGHT))
         return crs_x, crs_y
+
+    def customize(self, rot_deg: float = 0.0, gain_x: float = 1.0, gain_y: float = 1.0,
+                  off_x: float = 0.0, off_y: float = 0.0) -> None:
+        """
+        Compose an extra screen-space rotation/gain/offset on top of the current
+        map, exactly like Naji's rotation_custom/scale_custom/offset_custom
+        (applied in reaching_functions.get_mapped_values after the base AE/PCA
+        map): recentre on the screen middle, rotate (screen space is left-handed,
+        hence the sign flip), apply a per-axis gain -- negative flips that axis --
+        then offset. Composes into the same (A, b) used by transform(), so calling
+        this repeatedly (e.g. from customize_bomi.py) keeps stacking correctly, and
+        the result is saved/loaded like any other BoMIMap.
+        """
+        center = np.array([BASE_WIDTH, BASE_HEIGHT]) / 2.0
+        rad = -np.radians(rot_deg)  # left-handed screen space
+        rot = np.array([[np.cos(rad), -np.sin(rad)], [np.sin(rad), np.cos(rad)]])
+        gain_rot = np.array([gain_x, gain_y])[:, None] * rot  # diag(gain) @ rot
+
+        self._A = gain_rot @ self._A
+        self._b = gain_rot @ (self._b - center) + center + np.array([off_x, off_y])
 
     def save(self, path: str) -> None:
         if not self.fitted:
             raise RuntimeError("Cannot save an unfitted BoMIMap.")
         np.savez(
             path,
-            mean=self._mean,
-            components=self._components,
-            scale=self._scale,
-            offset=self._offset,
+            w1=self._w1, b1=self._b1,
+            w2=self._w2, b2=self._b2,
+            w3=self._w3, b3=self._b3,
+            A=self._A,
+            b=self._b,
         )
 
     def load(self, path: str) -> None:
         data = np.load(path)
-        self._mean = data["mean"]
-        self._components = data["components"]
-        self._scale = data["scale"]
-        self._offset = data["offset"]
+        if "w1" not in data:
+            raise ValueError(
+                f"'{path}' is not an autoencoder calibration (keys: {list(data.keys())}). "
+                "It was probably saved by the old PCA map: run again with --calibrate."
+            )
+        self._w1, self._b1 = data["w1"], data["b1"]
+        self._w2, self._b2 = data["w2"], data["b2"]
+        self._w3, self._b3 = data["w3"], data["b3"]
+        self._A = data["A"]
+        self._b = data["b"]
         self.fitted = True
+
+
+# --- PCA forward map (replaced by the autoencoder above) ---
+# class BoMIMap:
+#     """
+#     PCA forward map: raw hand landmarks -> 2D cursor in screen space.
+#
+#     PCA(2 components) fitted directly on the raw landmark samples. Scale/offset 
+#     map the calibration scores' peak-to-peak range onto the screen size, centered 
+#     on the mean.
+#
+#     The fitted parameters (PCA mean, components, scale, offset) are plain numpy
+#     arrays, so the map can be saved to / loaded from a .npz file and reused
+#     without repeating calibration.
+#     """
+#
+#     def __init__(self) -> None:
+#         self._mean = None         # PCA mean (42,)
+#         self._components = None   # PCA components (2, 42)
+#         self._scale = np.ones(2)
+#         self._offset = np.zeros(2)
+#         self.fitted = False
+#
+#     def fit(self, samples: list) -> None:
+#         X = np.array(samples)
+#
+#         pca = PCA(n_components=2)
+#         scores = pca.fit_transform(X)
+#
+#         extent = np.ptp(scores, axis=0)
+#         extent = np.where(extent > 1e-6, extent, 1.0)
+#
+#         screen = np.array([BASE_WIDTH, BASE_HEIGHT], dtype=float)
+#
+#         # Store the plain arrays needed for inference (decoupled from the sklearn object)
+#         self._mean = pca.mean_
+#         self._components = pca.components_
+#         self._scale = screen / extent
+#         self._offset = screen / 2.0 - (scores * self._scale).mean(axis=0)
+#         self.fitted = True
+#
+#     def transform(self, features: np.ndarray) -> tuple:
+#         cu = np.dot(features - self._mean, self._components.T)
+#         cu = cu * self._scale + self._offset
+#         crs_x = float(np.clip(cu[0], 0, BASE_WIDTH))
+#         crs_y = float(np.clip(cu[1], 0, BASE_HEIGHT))
+#         return crs_x, crs_y
+#
+#     def save(self, path: str) -> None:
+#         if not self.fitted:
+#             raise RuntimeError("Cannot save an unfitted BoMIMap.")
+#         np.savez(
+#             path,
+#             mean=self._mean,
+#             components=self._components,
+#             scale=self._scale,
+#             offset=self._offset,
+#         )
+#
+#     def load(self, path: str) -> None:
+#         data = np.load(path)
+#         self._mean = data["mean"]
+#         self._components = data["components"]
+#         self._scale = data["scale"]
+#         self._offset = data["offset"]
+#         self.fitted = True
 
 
 # --- Socket ---
@@ -367,6 +530,31 @@ class RobotSocket:
         except OSError:
             pass
         self._sock.close()
+
+
+def update_bomi_cursor(cap, landmarker, bomi_map: BoMIMap, cursor_filter: CursorFilter,
+                       crs_x: float, crs_y: float):
+    """One iteration of hand tracking: reads a webcam frame, runs the hand
+    landmarker, and returns (frame_with_landmarks, crs_x, crs_y, hand_detected).
+    Cursor position is carried over unchanged when no hand is detected."""
+    ret, frame = cap.read()
+    if not ret:
+        return None, crs_x, crs_y, False
+
+    frame = cv2.flip(frame, 1)
+    rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+    mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb_frame)
+    results = landmarker.detect_for_video(mp_image, int(time.time() * 1000))
+
+    if not results.hand_landmarks:
+        return frame, crs_x, crs_y, False
+
+    hl = results.hand_landmarks[0]
+    _draw_hand_landmarks(frame, hl)
+    mirror_x = results.handedness[0][0].category_name == "Right"
+    crs_x, crs_y = bomi_map.transform(_extract_hand_features(hl, mirror_x))
+    crs_x, crs_y = cursor_filter.update(crs_x, crs_y)
+    return frame, crs_x, crs_y, True
 
 
 # --- Phases ---
@@ -420,8 +608,8 @@ def _control_phase(cap, landmarker, bomi_map: BoMIMap, robot: RobotSocket) -> No
     dt = 1.0 / SEND_HZ
     last_send = time.time()
     cursor_filter = CursorFilter()
-    cam_window = "BoMI - Control"
-    map_window = "BoMI - Cursor Map"
+    cam_window = CAM_WINDOW_NAME
+    map_window = MAP_WINDOW_NAME
 
     # Start centered (region 5) until the first hand detection updates it.
     crs_x, crs_y = BASE_WIDTH / 2.0, BASE_HEIGHT / 2.0
@@ -556,7 +744,7 @@ def main() -> None:
             bomi_map.fit(samples)
             os.makedirs(os.path.dirname(calib_path) or ".", exist_ok=True)
             bomi_map.save(calib_path)
-            print(f"PCA map fitted and saved to {calib_path}")
+            print(f"Autoencoder map fitted and saved to {calib_path}")
         else:
             bomi_map.load(calib_path)
             print(f"Loaded calibration from {calib_path} (no calibration phase)")

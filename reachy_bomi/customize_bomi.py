@@ -1,0 +1,167 @@
+#!/usr/bin/env python3
+"""
+Standalone BoMI customization tool -- no robot connection needed.
+
+Loads a calibration previously saved with calibrate_bomi.py (or socket_client.py --calibrate), lets you rotate,
+flip and rescale the cursor map live (exactly like Naji's "Customization" step:
+rotation_custom/scale_custom/offset_custom composed on top of the base AE map),
+and saves the result as a brand new calibration -- the original file is never
+modified, so you can always go back to it.
+
+Keys:
+    [ / ]   rotate -5 / +5 degrees
+    i / o   flip X axis / flip Y axis
+    - / =   scale down / up (both axes)
+    h / l   nudge offset left / right
+    k / j   nudge offset up / down
+    r       reset (discard all changes, reload the original map)
+    s       save as... (prompts for a new calibration name)
+    q       quit without saving
+
+Usage:
+    python3 customize_bomi.py NAME [--cam INDEX] [--model PATH]
+
+    NAME is the calibration to load, e.g. "elisa" for calibrations/elisa.npz
+    (the .npz extension is optional). The customized map is saved under a
+    different name you choose when pressing 's'.
+"""
+
+import argparse
+import os
+import sys
+
+import cv2
+from mediapipe.tasks.python.core import base_options
+from mediapipe.tasks.python.vision import hand_landmarker
+from mediapipe.tasks.python.vision.core import vision_task_running_mode
+
+import socket_client as bomi
+
+ROT_STEP_DEG = 5.0
+SCALE_STEP = 1.1     # multiplicative
+OFFSET_STEP_PX = 10.0
+
+HELP_TEXT = (
+    "[ ]=rotate  i/o=flip X/Y  -/+=scale  hjkl=offset  r=reset  s=save as...  q=quit"
+)
+
+
+def _prompt_and_save(bomi_map: bomi.BoMIMap) -> bool:
+    """Returns True once the map is actually saved (False if the user cancels
+    with a blank name, so the caller keeps previewing)."""
+    name = input("Save customized calibration as (blank = cancel): ").strip()
+    if not name:
+        print("Cancelled.")
+        return False
+    path = bomi._resolve_calib_path(name)
+    os.makedirs(bomi.CALIB_DIR, exist_ok=True)
+    bomi_map.save(path)
+    print(f"Saved to {path}")
+    return True
+
+
+def _customize_and_save(cap, landmarker, calib_path: str) -> None:
+    bomi_map = bomi.BoMIMap()
+    bomi_map.load(calib_path)
+
+    cursor_filter = bomi.CursorFilter()
+    crs_x, crs_y = bomi.BASE_WIDTH / 2.0, bomi.BASE_HEIGHT / 2.0
+    map_window = bomi.MAP_WINDOW_NAME
+
+    print(f"\n=== CUSTOMIZE '{calib_path}' (nothing is sent anywhere) ===")
+    print(HELP_TEXT)
+
+    while True:
+        _, crs_x, crs_y, _ = bomi.update_bomi_cursor(
+            cap, landmarker, bomi_map, cursor_filter, crs_x, crs_y,
+        )
+        region = bomi.check_region_cursor(crs_x, crs_y)
+        cv2.imshow(map_window, bomi._draw_cursor_map(crs_x, crs_y, region, HELP_TEXT))
+
+        key = cv2.waitKey(1) & 0xFF
+
+        if key == ord('['):
+            bomi_map.customize(rot_deg=-ROT_STEP_DEG)
+        elif key == ord(']'):
+            bomi_map.customize(rot_deg=ROT_STEP_DEG)
+        elif key == ord('i'):
+            bomi_map.customize(gain_x=-1.0)
+        elif key == ord('o'):
+            bomi_map.customize(gain_y=-1.0)
+        elif key == ord('-'):
+            bomi_map.customize(gain_x=1.0 / SCALE_STEP, gain_y=1.0 / SCALE_STEP)
+        elif key == ord('='):
+            bomi_map.customize(gain_x=SCALE_STEP, gain_y=SCALE_STEP)
+        elif key == ord('h'):
+            bomi_map.customize(off_x=-OFFSET_STEP_PX)
+        elif key == ord('l'):
+            bomi_map.customize(off_x=OFFSET_STEP_PX)
+        elif key == ord('k'):
+            bomi_map.customize(off_y=-OFFSET_STEP_PX)
+        elif key == ord('j'):
+            bomi_map.customize(off_y=OFFSET_STEP_PX)
+        elif key == ord('r'):
+            bomi_map.load(calib_path)
+            print("Reset to the original calibration.")
+        elif key == ord('s'):
+            if _prompt_and_save(bomi_map):
+                return
+        elif bomi._quit_requested(key, map_window):
+            print("Closed without saving.")
+            return
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    parser.add_argument("name", help="Calibration to load, e.g. 'elisa' for calibrations/elisa.npz")
+    parser.add_argument("--cam", type=int, default=0, help="Webcam index (default: 0)")
+    parser.add_argument("--model", default=bomi.DEFAULT_MODEL_PATH,
+                        help="Path to the MediaPipe hand_landmarker.task model.")
+    cli_args = parser.parse_args()
+
+    calib_path = bomi._resolve_calib_path(cli_args.name)
+    if not os.path.exists(calib_path):
+        print(f"[ERROR] No calibration file '{calib_path}' found.")
+        if os.path.isdir(bomi.CALIB_DIR):
+            available = [f for f in os.listdir(bomi.CALIB_DIR) if f.endswith(".npz")]
+            if available:
+                print("        Available: " + ", ".join(sorted(available)))
+        sys.exit(1)
+
+    if not os.path.exists(cli_args.model):
+        print(f"[ERROR] MediaPipe model not found: '{cli_args.model}'")
+        print("        Download hand_landmarker.task and pass its path with --model.")
+        sys.exit(1)
+
+    cap = None
+    landmarker = None
+    try:
+        cap = cv2.VideoCapture(cli_args.cam, cv2.CAP_V4L2)
+        if not cap.isOpened():
+            print(f"[ERROR] Cannot open camera {cli_args.cam}")
+            sys.exit(1)
+        cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)  # always the freshest frame, not a growing backlog
+
+        landmarker_options = hand_landmarker.HandLandmarkerOptions(
+            base_options=base_options.BaseOptions(model_asset_path=cli_args.model),
+            running_mode=vision_task_running_mode.VisionTaskRunningMode.VIDEO,
+            num_hands=1,
+            min_hand_detection_confidence=0.7,
+            min_hand_presence_confidence=0.5,
+            min_tracking_confidence=0.5,
+        )
+        landmarker = hand_landmarker.HandLandmarker.create_from_options(landmarker_options)
+
+        _customize_and_save(cap, landmarker, calib_path)
+    finally:
+        if cap is not None:
+            cap.release()
+        cv2.destroyAllWindows()
+        if landmarker is not None:
+            landmarker.close()
+
+
+if __name__ == "__main__":
+    main()

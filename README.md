@@ -2,7 +2,7 @@
 
 A ROS 2 package that turns **hand movements into velocity commands for the Reachy 2 mobile base**.
 
-A webcam tracks the operator's hand with [MediaPipe](https://developers.google.com/mediapipe), a calibrated PCA map converts the hand pose into a 2D cursor, and the cursor position is mapped to linear/angular velocities. Those velocities are streamed over a TCP socket to the robot side, republished on ROS 2 topics, and finally written to `/cmd_vel`, so the base moves in a Gazebo simulation (or on the real robot).
+A webcam tracks the operator's hand with [MediaPipe](https://developers.google.com/mediapipe), a calibrated autoencoder map converts the hand pose into a 2D cursor, and the cursor position is mapped to linear/angular velocities. Those velocities are streamed over a TCP socket to the robot side, republished on ROS 2 topics, and finally written to `/cmd_vel`, so the base moves in a Gazebo simulation (or on the real robot).
 
 This work started from a ROS 1 implementation written for the TIAGo robot and was ported to ROS 2 for Reachy 2.
 
@@ -16,7 +16,7 @@ The system is **distributed across two machines**:
   OPERATOR PC                          ROBOT / SIMULATION PC
   ───────────                          ─────────────────────
   webcam → MediaPipe                   socket_server (always-on bridge node)
-        → PCA cursor                        ├─ receives socket messages
+        → autoencoder cursor                ├─ receives socket messages
         → 9-region velocity                 ├─ publishes socket_server/* topics
         → TCP socket  ───────────────▶      └─ on "scenario:..." → launches
      (socket_client.py)                          bomi_control.launch.py
@@ -25,7 +25,7 @@ The system is **distributed across two machines**:
                                               └─ ros2 bag record
 ```
 
-1. **`socket_client.py`** runs on the **operator PC** (not on the robot). It needs a webcam and the MediaPipe stack. Optionally, it first sends a scenario request (`scenario:<name> rviz:<true|false> record:<true|false>`) and waits for the simulation to come up; it then calibrates a PCA hand-to-cursor map and continuously sends velocity strings such as `lin_vel:0.500 ang_vel:-0.300` over TCP at 20Hz.
+1. **`socket_client.py`** runs on the **operator PC** (not on the robot). It needs a webcam and the MediaPipe stack. Optionally, it first sends a scenario request (`scenario:<name> rviz:<true|false> record:<true|false>`) and waits for the simulation to come up; it then calibrates an autoencoder hand-to-cursor map and continuously sends velocity strings such as `lin_vel:0.500 ang_vel:-0.300` over TCP at 20Hz.
 2. **`socket_server.py`** (ROS 2 node, started once via `bomi_bridge.launch.py` and left running) opens the TCP server and decodes incoming messages. Velocity/state messages are published on `socket_server/linear_vel`, `socket_server/angular_vel`, `socket_server/base_state`. A `scenario:...` message instead makes it run `ros2 launch reachy_bomi bomi_control.launch.py` itself (terminating any scenario it had previously launched).
 3. **`cmd_vel_publisher.py`** (ROS 2 node, started by `bomi_control.launch.py`) subscribes to those topics and, while the base is in velocity mode (`base_state == 1.0`), publishes a `geometry_msgs/Twist` on `/cmd_vel`.
 4. **`bomi_control.launch.py`** starts the **Reachy simulation in Gazebo** (via `reachy_bringup`) with the world chosen by the selected scenario, `cmd_vel_publisher`, and (optionally) records a **ROS 2 bag** of the run. It can also be launched manually on the robot PC instead of being triggered remotely — see [Usage](#usage).
@@ -47,7 +47,7 @@ The **velocity computation does not depend on the scenario** — the scenario on
 **Operator PC (client, plain Python — no ROS required):**
 
 ```bash
-pip install mediapipe opencv-python scikit-learn numpy scipy
+pip install mediapipe opencv-python tensorflow numpy scipy
 ```
 If necessary, create a virtual environment.
 
