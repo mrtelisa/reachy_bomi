@@ -6,3 +6,5 @@ install/
 log/
 *.npz
 File_BoMI_Naji/
+*.png
+reachy_bomi/tests/
