@@ -121,7 +121,12 @@ CAMERA_VIEWER_SCRIPT = os.path.join(os.path.dirname(os.path.abspath(__file__)), 
 
 # global param to let _on_emergency_quit/main()'s block work,
 # however deep in the call stack the quit was triggered from.
-_in_grasp_phase = False # True for the duration of _run_grasp_mode
+# Latches True the first time object selection opens and never clears: from
+# that point on the robot is working next to the table, so any shutdown --
+# ESC/Q included -- has to back the base away and rotate it before the arms
+# fold in, not just power off where it stands. Before that it's only driving
+# around, with nothing to back away from.
+_grasp_phase_entered = False
 _camera_viewer_proc: Optional[subprocess.Popen] = None # head-camera-viewer subprocess, if one is currently running
 
 
@@ -178,8 +183,8 @@ def _run_grasp_mode(cap, landmarker, bomi_map, cursor_filter, depth_cam, model, 
     letting main()'s finally block power everything off). Any "No"/quit along
     the way, other than the post-place prompt, just ends the run with no
     explicit wind-down -- main()'s finally block handles that generically."""
-    global _in_grasp_phase
-    _in_grasp_phase = True
+    global _grasp_phase_entered
+    _grasp_phase_entered = True
     try:
         make_window_fullscreen(reachy_detection.CAM_WINDOW_NAME)
         captured = reachy_detection.capture_and_detect(
@@ -283,10 +288,11 @@ def _run_grasp_mode(cap, landmarker, bomi_map, cursor_filter, depth_cam, model, 
                 _finish_session(reachy, mobile_base)
                 break
 
-        safety.destroy_window(reachy_detection.CAM_WINDOW_NAME)  # tolerant of it already being gone
         return crs_x, crs_y
     finally:
-        _in_grasp_phase = False
+        # In the finally so it also runs if something raises its way out of
+        # here; tolerant of the window already being gone either way.
+        safety.destroy_window(reachy_detection.CAM_WINDOW_NAME)
 
 
 # Superseded by _place_and_wind_down below -- kept for reference/rollback
@@ -851,12 +857,11 @@ def main() -> None:
 
     def _on_emergency_quit() -> None:
         stop_camera_viewer()
-        # Always back up + rotate before powering off on ESC/Q, not just
-        # while _run_grasp_mode is active -- rotate_base_once is a harmless
-        # no-op if the arms aren't near anything, and safe to call at any
-        # point in the program's lifecycle (it turns the base on itself if
-        # needed and swallows its own errors).
-        safety.emergency_shutdown(reachy, mobile_base, rotate_base_before_shutdown=True)
+        # Back up + rotate before powering off from the moment object
+        # selection first opened, whatever the robot happens to be doing when
+        # ESC/Q lands -- object selection, a confirm dialog, mid-grasp. Before
+        # that it's only driving around, with nothing to back away from.
+        safety.emergency_shutdown(reachy, mobile_base, rotate_base_before_shutdown=_grasp_phase_entered)
 
     safety.start_global_quit_watcher(_on_emergency_quit)
     stop_terminal_watcher = safety.start_terminal_quit_watcher(_on_emergency_quit)
@@ -907,7 +912,7 @@ def main() -> None:
         stop_camera_viewer()
         if stop_terminal_watcher is not None:
             stop_terminal_watcher()
-        safety.safe_robot_shutdown(reachy, mobile_base, rotate_base_before_shutdown=True)
+        safety.safe_robot_shutdown(reachy, mobile_base, rotate_base_before_shutdown=_grasp_phase_entered)
         if cap is not None:
             cap.release()
         cv2.destroyAllWindows()

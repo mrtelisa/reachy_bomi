@@ -50,18 +50,25 @@ def rotate_base_once(mobile_base, reverse_cm: float = SHUTDOWN_REVERSE_CM) -> No
     """Translate back + rotate SHUTDOWN_ROTATION_DEG, but only the first time
     this is called in the whole process -- guards against the wind-down
     rotation and an ESC-triggered shutdown (or two quit watchers) firing at
-    the same time and rotating the base twice."""
+    the same time and rotating the base twice.
+
+    The lock is held for the whole movement, not just the flag check, so a
+    second caller *waits here* instead of returning while the rotation is
+    still running. It has to: both callers go on to power the robot off and
+    disconnect, and doing that mid-rotation kills the rotation and drops the
+    arms -- which is what pressing ESC used to do, since ESC reaches both the
+    quit watcher's thread and the dwell loop's own quit check."""
     global _rotation_done
     with _rotation_lock:
         if _rotation_done or mobile_base is None:
             return
         _rotation_done = True
-    try:
-        mobile_base.turn_on()
-        mobile_base.translate_by(x=-reverse_cm / 100.0, y=0.0, wait=True)
-        mobile_base.rotate_by(SHUTDOWN_ROTATION_DEG, wait=True)
-    except Exception as exc:
-        print(f"[WARN] Could not rotate the base ({exc}).")
+        try:
+            mobile_base.turn_on()
+            mobile_base.translate_by(x=-reverse_cm / 100.0, y=0.0, wait=True)
+            mobile_base.rotate_by(SHUTDOWN_ROTATION_DEG, wait=True)
+        except Exception as exc:
+            print(f"[WARN] Could not rotate the base ({exc}).")
 
 
 def force_fullscreen(window_name: str) -> None:
