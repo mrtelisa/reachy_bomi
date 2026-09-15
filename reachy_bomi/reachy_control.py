@@ -385,15 +385,15 @@ def _resolve_and_confirm_place_point(
     cap, landmarker, bomi_map, cursor_filter, crs_x, crs_y,
     depth_cam, reachy, grasp_plans: dict, geometry: reachy_grasp.ObjectGeometry,
 ) -> tuple:
-    """Dwell-selects a placement point on a fixed reachability grid
-    (reachy_selection.select_place_location_bomi, which already IK-checks
-    every cell for every arm in grasp_plans when it builds the grid --
-    unreachable cells are shown red and can't be dwelled on, so there's no
-    separate "not reachable" retry needed here), then asks a Yes/No dwell
-    confirm on the point itself (reachy_selection.confirm_place_bomi) --
-    "No" re-offers point selection (a fresh grid, in case anything moved).
-    Runs entirely before execute_grasp, so nothing has been physically
-    grasped yet: quitting at either step just aborts, nothing to place back.
+    """Builds the reachability grid once (reachy_selection.build_place_grid,
+    which IK-checks every cell for every arm in grasp_plans -- unreachable
+    cells are shown red and can't be dwelled on, so there's no separate "not
+    reachable" retry needed here), then dwell-selects a placement point on it
+    and asks a Yes/No dwell confirm (reachy_selection.confirm_place_bomi).
+    "No" re-offers that same already-computed grid rather than paying for the
+    IK search again. Runs entirely before execute_grasp, so nothing has been
+    physically grasped yet: quitting at either step just aborts, nothing to
+    place back.
 
     Returns the raw target point plus the arm that can serve it, not a ready
     GraspPlan: the caller should re-run plan_grasp/plan_place for that arm
@@ -402,9 +402,13 @@ def _resolve_and_confirm_place_point(
     solvable).
     Returns (confirmed target point, arm_name, crs_x, crs_y), or
     (None, None, crs_x, crs_y) if the user quit instead of confirming."""
+    grid = reachy_selection.build_place_grid(depth_cam, reachy, grasp_plans, geometry)
+    if grid is None:
+        return None, None, crs_x, crs_y
+
     while True:
         target_point, place_arm, crs_x, crs_y = reachy_selection.select_place_location_bomi(
-            cap, landmarker, bomi_map, cursor_filter, crs_x, crs_y, depth_cam, reachy, grasp_plans, geometry,
+            cap, landmarker, bomi_map, cursor_filter, crs_x, crs_y, grid,
         )
         if target_point is None:
             return None, None, crs_x, crs_y

@@ -35,11 +35,18 @@ GRASP_APPROACH_MARGIN_DX_M = 0.0  # r_arm
 GRASP_APPROACH_MARGIN_SX_M = -0.02  # l_arm TODO: find right value
 _GRASP_APPROACH_MARGIN_BY_ARM = {"r_arm": GRASP_APPROACH_MARGIN_DX_M, "l_arm": GRASP_APPROACH_MARGIN_SX_M}
 
-# Empirical correction for plan_place: releasing exactly at the original
-# grasp height lands a bit lower than intended (object slip in the gripper
-# during transit and/or arm sag under the object's weight) -- release this
-# much higher instead. TODO: find the right value / whether it's per-arm too
-PLACE_HEIGHT_MARGIN_M = 0.007
+# How much higher than the original grasp height plan_place releases the
+# object, per arm: releasing at exactly that height lands a bit off (object
+# slip in the gripper during transit, arm sag under its weight), and by a
+# different amount per arm -- the left one observed to let go higher than
+# the right, the same arm that already needs GRASP_APPROACH_MARGIN_SX_M, so
+# probably the same underlying sag. Positive raises the release point.
+PLACE_HEIGHT_MARGIN_DX_M = 0.007  # r_arm, observed to place correctly
+# l_arm TODO: find right value. It releases higher than r_arm, so it wants
+# less margin, not more -- tune downward (negative is allowed) rather than
+# up, since overshooting the other way presses the object into the table.
+PLACE_HEIGHT_MARGIN_SX_M = -0.003
+_PLACE_HEIGHT_MARGIN_BY_ARM = {"r_arm": PLACE_HEIGHT_MARGIN_DX_M, "l_arm": PLACE_HEIGHT_MARGIN_SX_M}
 
 # Fallback "up" direction (Reachy world frame) when the table plane fit fails 
 DEFAULT_TABLE_NORMAL: npt.NDArray[np.float64] = np.array([0.0, 0.0, 1.0])
@@ -335,10 +342,9 @@ def plan_place(
         the lift ended at.
       - grasp_matrix: "place" -- same horizontal position, dropped back down
         by the same distance plan.lift_matrix climbed above plan.grasp_matrix
-        (where the gripper opens), plus PLACE_HEIGHT_MARGIN_M -- releasing
-        exactly at the original grasp height was empirically landing a bit
-        lower than intended (slip in the gripper during transit and/or arm
-        sag under the object's weight).
+        (where the gripper opens), plus this arm's own
+        _PLACE_HEIGHT_MARGIN_BY_ARM -- releasing at exactly the original
+        grasp height lands a bit off, by a different amount per arm.
       - pregrasp_matrix: "retreat" -- PREGRASP_STANDOFF_M back out from
         there once the gripper has opened, along the winning orientation's
         own forward axis rather than up along table_normal or any direction
@@ -359,7 +365,7 @@ def plan_place(
 
     target_inplane = target_point - normal * np.dot(target_point, normal)
     lift_height = np.dot(plan.lift_matrix[:3, 3], normal)
-    grasp_height = np.dot(plan.grasp_matrix[:3, 3], normal) + PLACE_HEIGHT_MARGIN_M
+    grasp_height = np.dot(plan.grasp_matrix[:3, 3], normal) + _PLACE_HEIGHT_MARGIN_BY_ARM[plan.arm_name]
 
     transit_position = target_inplane + normal * lift_height
     place_position = target_inplane + normal * grasp_height

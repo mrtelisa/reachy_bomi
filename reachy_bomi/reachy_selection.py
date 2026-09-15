@@ -13,7 +13,7 @@ same box_contains/find_hovered_detection geometry from a real mouse instead.
 
 import math
 import time
-from typing import List, Optional
+from typing import List, NamedTuple, Optional
 
 import cv2
 import numpy as np
@@ -69,6 +69,22 @@ PLACE_GRID_CANDIDATE_COUNT = reachy_grasp.QUICK_REACHABILITY_CANDIDATE_COUNT
 
 COLOR_UNREACHABLE = (0, 0, 200)   # BGR red, translucent fill over unreachable/unknown table area
 UNREACHABLE_TINT_ALPHA = 0.35
+
+
+class PlaceGrid(NamedTuple):
+    """One computed placement grid: the frozen frame it was built from, which
+    table-plane cell each screen block belongs to, and what each cell is
+    worth. Built once by build_place_grid, then dwelled on as many times as
+    needed by select_place_location_bomi -- so answering "No" to the
+    placement confirm doesn't pay for the IK search all over again."""
+
+    base_frame: np.ndarray            # the frozen RGB frame the dwell draws on
+    stride: int                       # screen px per entry of the coarse_* images
+    coarse_row_img: np.ndarray        # int32, table-plane cell row per block, -1 where depth was invalid
+    coarse_col_img: np.ndarray        # int32, same for the column
+    cell_targets: dict                # {(row, col): xyz point}
+    cell_arms: dict                   # {(row, col): arm_name or None if neither arm can place there}
+    unreachable_mask: np.ndarray      # full-res bool, True where the area is unknown or unreachable
 
 CONFIRM_WINDOW_NAME = "BoMI - Confirm Grasp"
 CONFIRM_CANVAS_WIDTH = 520
@@ -396,55 +412,73 @@ def _build_place_grid(depth_cam, depth_frame, frame_w, frame_h, reachy, grasp_pl
     return stride, coarse_row_img, coarse_col_img, cell_targets, cell_arms, unreachable_mask
 
 
-def select_place_location_bomi(
-    cap, landmarker, bomi_map, cursor_filter, crs_x, crs_y, depth_cam, reachy, grasp_plans, geometry,
-):
-    """Dwell-to-pick-a-cell loop for placing an already-grasped object (e.g.
-    "put it in the box"), the cells laid out on the table plane itself
-    (_build_place_grid) rather than the screen. Captures a single torso
-    RGB+depth frame up front -- same as select_object_to_grasp_bomi does for
-    its YOLO detections -- then builds the grid and precomputes each cell's
-    reachability once. Unlike a free-floating anchor, dwelling is then just
-    "is the cursor still over the same table cell as last frame" -- cells
-    don't move, so cursor tremor within one never resets the dwell, only
-    actually crossing into a different cell does.
+def build_place_grid(depth_cam, reachy, grasp_plans, geometry) -> Optional[PlaceGrid]:
+    """Captures one torso RGB+depth frame -- same as select_object_to_grasp_bomi
+    does for its YOLO detections -- and computes the whole placement grid
+    from it (_build_place_grid): the expensive "Computing reachable area..."
+    step, an IK search per cell.
 
-    Unreachable/unknown table area is tinted red and never accumulates dwell
-    progress (hovering it behaves like hovering nothing), which steers the
-    user away from it without a separate error dialog.
+    Kept separate from select_place_location_bomi's dwell loop so one grid
+    can serve several dwells: answering "No" to the placement confirm
+    re-offers the grid already computed instead of paying for it again.
 
     grasp_plans is {arm_name: GraspPlan} for every arm that can pick the
     object up (reachy_grasp.plan_grasps_by_arm) -- the grid shows the union
-    of their reach, and the confirmed cell is what decides which arm
-    actually does the job.
+    of their reach, and the cell the user settles on is what decides which
+    arm does the job.
 
-    Confirmed by dwelling on the same reachable cell for PLACE_HOVER_SECONDS.
-    Returns that cell's raw 3D target point and the arm that serves it, not
-    the GraspPlan _build_place_grid computed -- the caller should re-derive
-    the actual grasp and place plans right before moving, per
-    _build_place_grid's docstring.
-
-    Returns (target point [xyz, m, Reachy world frame], arm_name, crs_x,
-    crs_y), or (None, None, crs_x, crs_y) if the user quit, the initial
-    capture failed, or there's no depth frame to build a grid from."""
+    Returns None if the frame couldn't be captured or came without depth."""
     capture = reachy_detection.capture_rgb_and_depth(depth_cam)
     if capture is None:
         print("[place] could not capture a frame from the depth camera")
-        return None, None, crs_x, crs_y
+        return None
     base_frame, depth_frame = capture
     frame_h, frame_w = base_frame.shape[:2]
     if depth_frame is None:
         print("[place] no depth frame available -- can't compute a placement grid")
-        return None, None, crs_x, crs_y
+        return None
 
     wait_frame = base_frame.copy()
     cv2.putText(wait_frame, "Computing reachable area...", (30, 40),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.9, COLOR_BUTTON_TEXT, 2)
     cv2.imshow(reachy_detection.CAM_WINDOW_NAME, wait_frame)
     cv2.waitKey(1)
+
     stride, coarse_row_img, coarse_col_img, cell_targets, cell_arms, unreachable_mask = _build_place_grid(
         depth_cam, depth_frame, frame_w, frame_h, reachy, grasp_plans, geometry,
     )
+    return PlaceGrid(
+        base_frame=base_frame, stride=stride,
+        coarse_row_img=coarse_row_img, coarse_col_img=coarse_col_img,
+        cell_targets=cell_targets, cell_arms=cell_arms, unreachable_mask=unreachable_mask,
+    )
+
+
+def select_place_location_bomi(cap, landmarker, bomi_map, cursor_filter, crs_x, crs_y, grid: PlaceGrid):
+    """Dwell-to-pick-a-cell loop for placing an already-grasped object (e.g.
+    "put it in the box"), against an already-built grid whose cells are laid
+    out on the table plane itself rather than on the screen. Unlike a
+    free-floating anchor, dwelling is just "is the cursor still over the same
+    table cell as last frame" -- cells don't move, so cursor tremor within
+    one never resets the dwell, only actually crossing into a different cell
+    does.
+
+    Unreachable/unknown table area is tinted red and never accumulates dwell
+    progress (hovering it behaves like hovering nothing), which steers the
+    user away from it without a separate error dialog.
+
+    Confirmed by dwelling on the same reachable cell for PLACE_HOVER_SECONDS.
+    Returns that cell's raw 3D target point and the arm that serves it, not
+    the GraspPlan the grid computed -- the caller should re-derive the actual
+    grasp and place plans right before moving, per _build_place_grid's
+    docstring.
+
+    Returns (target point [xyz, m, Reachy world frame], arm_name, crs_x,
+    crs_y), or (None, None, crs_x, crs_y) if the user quit."""
+    base_frame = grid.base_frame
+    stride, cell_targets, cell_arms = grid.stride, grid.cell_targets, grid.cell_arms
+    coarse_row_img, coarse_col_img, unreachable_mask = grid.coarse_row_img, grid.coarse_col_img, grid.unreachable_mask
+    frame_h, frame_w = base_frame.shape[:2]
     coarse_h, coarse_w = coarse_row_img.shape
 
     tracked_cell = None  # the reachable cell currently accumulating dwell, or None
