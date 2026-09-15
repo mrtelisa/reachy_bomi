@@ -47,8 +47,9 @@ from gazebo_msgs.srv import SetEntityState
 from geometry_msgs.msg import PointStamped
 from nav_msgs.msg import Odometry
 from rclpy.node import Node
-from scipy.signal import find_peaks
 from std_msgs.msg import Float32, String
+
+from reachy_bomi.reaching_metrics import compute_trial_metrics
 
 TARGET_MODEL = "reaching_target"   # marker model in worlds/reaching.world
 HIDDEN_Z = -2.0                    # marker parked below the ground plane (pole included)
@@ -60,94 +61,6 @@ DEFAULT_RESULTS_DIR = os.path.expanduser("~/reachy_bomi_bags")
 
 def _yaw_from_quaternion(q) -> float:
     return math.atan2(2.0 * (q.w * q.z + q.x * q.y), 1.0 - 2.0 * (q.y * q.y + q.z * q.z))
-
-
-# --- Metrics ---
-def compute_trial_metrics(samples, goal, t_shown, t_reach, onset_speed, peak_threshold, resample_hz):
-    """
-    samples: list of (t, x, y, vx, vy) in the odom frame, from target shown to
-    trial end. goal: (x, y). t_reach: time the target was entered for the last
-    time (None if missed -> the whole trial is used).
-    Returns a dict of metrics (None where not computable).
-    """
-    m = {
-        "reaction_time": None, "movement_time": None, "reach_time": None,
-        "path_length": None, "straight_distance": None, "normalized_path_length": None,
-        "max_deviation": None, "dimensionless_jerk": None, "log_dimensionless_jerk": None,
-        "n_speed_peaks": None, "mean_speed": None, "peak_speed": None,
-    }
-    if len(samples) < 3:
-        return m
-    arr = np.asarray(samples, dtype=float)
-    t, x, y, vx, vy = arr.T
-    speed = np.hypot(vx, vy)
-
-    if t_reach is not None:
-        m["reach_time"] = float(t_reach - t_shown)
-
-    moving = np.flatnonzero(speed > onset_speed)
-    if moving.size == 0:
-        return m
-    i_onset = int(moving[0])
-    t_onset = float(t[i_onset])
-    m["reaction_time"] = t_onset - t_shown
-
-    t_end = t_reach if t_reach is not None else float(t[-1])
-    i_end = int(np.searchsorted(t, t_end, side="right"))
-    if i_end - i_onset < 3:
-        return m
-    m["movement_time"] = t_end - t_onset
-
-    xy = np.column_stack([x[i_onset:i_end], y[i_onset:i_end]])
-    seg = np.diff(xy, axis=0)
-    path_length = float(np.sum(np.hypot(seg[:, 0], seg[:, 1])))
-    p0 = xy[0]
-    g = np.asarray(goal, dtype=float)
-    # Straight-line distance actually covered (onset -> where the movement
-    # ended, i.e. the target's edge when reached), so a perfectly straight
-    # reach gives normalized_path_length == 1.
-    straight = float(np.hypot(*(xy[-1] - p0)))
-    m["path_length"] = path_length
-    m["straight_distance"] = straight
-    if straight > 1e-6:
-        m["normalized_path_length"] = path_length / straight
-    # Max deviation from the ideal line onset -> target centre
-    ideal = float(np.hypot(*(g - p0)))
-    if ideal > 1e-6:
-        d = (g - p0) / ideal
-        rel = xy - p0
-        m["max_deviation"] = float(np.max(np.abs(rel[:, 0] * d[1] - rel[:, 1] * d[0])))
-
-    sp = speed[i_onset:i_end]
-    m["mean_speed"] = float(np.mean(sp))
-    m["peak_speed"] = float(np.max(sp))
-
-    # Uniform resampling before differentiating: /odom timestamps jitter.
-    dt = 1.0 / resample_hz
-    tt = t[i_onset:i_end]
-    tu = np.arange(tt[0], tt[-1], dt)
-    if tu.size < 5:
-        return m
-    xu = np.interp(tu, tt, x[i_onset:i_end])
-    yu = np.interp(tu, tt, y[i_onset:i_end])
-    vxu, vyu = np.gradient(xu, dt), np.gradient(yu, dt)
-    axu, ayu = np.gradient(vxu, dt), np.gradient(vyu, dt)
-    jxu, jyu = np.gradient(axu, dt), np.gradient(ayu, dt)
-    duration = tu[-1] - tu[0]
-    # Dimensionless jerk (Hogan & Sternad 2009), amplitude = straight-line displacement
-    if straight > 1e-6 and duration > 0:
-        jerk_int = float(np.sum(jxu ** 2 + jyu ** 2) * dt)
-        dj = math.sqrt(0.5 * jerk_int * duration ** 5 / straight ** 2)
-        m["dimensionless_jerk"] = dj
-        m["log_dimensionless_jerk"] = -math.log(dj) if dj > 0 else None
-
-    # Speed peaks: light moving-average smoothing, then local maxima above threshold
-    su = np.hypot(vxu, vyu)
-    k = max(1, int(round(0.1 * resample_hz)))  # 100 ms window
-    su_s = np.convolve(su, np.ones(k) / k, mode="same")
-    peaks, _ = find_peaks(su_s, height=peak_threshold, prominence=peak_threshold * 0.25)
-    m["n_speed_peaks"] = int(peaks.size)
-    return m
 
 
 # --- Node ---

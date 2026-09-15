@@ -9,3 +9,5 @@ File_BoMI_Naji/
 *.png
 reachy_bomi/tests/
 markerlessBoMI_FaMa-main/
+# Cursor reaching test outputs (reaching_cursor.py)
+results/
