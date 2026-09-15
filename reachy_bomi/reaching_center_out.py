@@ -20,12 +20,14 @@ are those of markerlessBoMI's main_reaching.py / reaching.py:
 The session timer starts when the centre (first goal) is reached for the
 first time. The session ends when the sequence is over or after --max-minutes
 (default 4), whichever comes first; the window closes and the results are
-saved (a subject with previous sessions gets <subject>_1, <subject>_2, ...):
-  results/<subject>_trials.csv     one row per trial (metrics)
-  results/<subject>_summary.json   success rate, mean metrics, config
+saved (a subject with previous sessions gets _1, _2, ... appended):
+  results_center_out/<subject>_center_out_trials.csv     one row per trial (metrics)
+  results_center_out/<subject>_center_out_summary.json   success rate, mean metrics, config
 
 Usage:
-    python3 reaching_cursor.py --calib <name> --subject S001 [--cam 0] [--max-minutes 4]
+    python3 reaching_center_out.py --calib <name> --subject S001 [--cam 0] [--max-minutes 4]
+(reaching_random.py runs the same test with targets in random order and no
+returns to the centre; it reuses everything in this file.)
 Keys: Q / ESC = abort (results so far are still saved).
 """
 
@@ -81,8 +83,8 @@ MOTION_ONSET_SPEED = 40.0     # [px/s]
 SPEED_PEAK_THRESHOLD = 80.0   # [px/s]
 RESAMPLE_HZ = 50.0
 
-RESULTS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "results")
-WINDOW = "BoMI - Reaching"
+RESULTS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "results_center_out")
+WINDOW = "BoMI - Reaching (center-out)"
 
 # Colours (BGR)
 BLACK = (0, 0, 0)
@@ -176,27 +178,34 @@ def build_trials(order: list) -> list:
             block += 1
 
 
-def session_name(subject: str) -> str:
-    """<subject> for the first session, then <subject>_1, <subject>_2, ...
-    (any existing results/<subject>_* file counts as a previous session)."""
-    existing = [f for f in os.listdir(RESULTS_DIR) if f == f"{subject}_summary.json" or f.startswith(f"{subject}_")]
+def session_name(subject: str, sequence: str, results_dir: str) -> str:
+    """<subject>_<sequence> for the first session, then <subject>_<sequence>_1,
+    _2, ... (any existing <results_dir>/<subject>_<sequence>* file counts as a
+    previous session)."""
+    prefix = f"{subject}_{sequence}"
+    existing = [f for f in os.listdir(results_dir) if f.startswith(prefix)]
     if not existing:
-        return subject
-    used = {int(m.group(1)) for f in existing for m in [re.match(rf"{re.escape(subject)}_(\d+)_(trials\.csv|summary\.json)$", f)] if m}
-    return f"{subject}_{max(used, default=0) + 1}"
+        return prefix
+    used = {int(m.group(1)) for f in existing
+            for m in [re.match(rf"{re.escape(prefix)}_(\d+)_(trials\.csv|summary\.json)$", f)] if m}
+    return f"{prefix}_{max(used, default=0) + 1}"
 
 
 class ReachingCursorTest:
-    def __init__(self, subject: str, max_minutes: float) -> None:
+    def __init__(self, subject: str, max_minutes: float, trials: list = None,
+                 results_dir: str = RESULTS_DIR, sequence: str = "center_out") -> None:
+        """trials/results_dir/sequence let another script (reaching_random.py)
+        reuse the whole test with a different goal sequence and output folder."""
         self.subject = subject
         self.max_seconds = max_minutes * 60.0
-        self.trials = build_trials(load_order())
+        self.trials = trials if trials is not None else build_trials(load_order())
+        self.sequence = sequence
         self.results = []
         self.score = 0
 
-        os.makedirs(RESULTS_DIR, exist_ok=True)
+        os.makedirs(results_dir, exist_ok=True)
         self.timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        self.base = os.path.join(RESULTS_DIR, session_name(subject))
+        self.base = os.path.join(results_dir, session_name(subject, sequence, results_dir))
 
         # Session/trial state (times are time.time())
         self.t_session0 = None
@@ -290,7 +299,7 @@ class ReachingCursorTest:
         if self.trial is not None and self.trial_i < len(self.trials) and reason != "completed":
             self._record_trial(t, success=False, reason=reason)
         summary = {
-            "subject": self.subject, "end_reason": reason,
+            "subject": self.subject, "sequence": self.sequence, "end_reason": reason,
             "n_trials_total": len(self.trials),
             "session_duration": (t - self.t_session0) if self.t_session0 is not None else 0.0,
             "timestamp": self.timestamp,
@@ -325,12 +334,13 @@ class ReachingCursorTest:
 class Screen:
     """Fullscreen window; the 1200x650 canvas is scaled uniformly and centred."""
 
-    def __init__(self) -> None:
-        cv2.namedWindow(WINDOW, cv2.WINDOW_NORMAL)
-        cv2.setWindowProperty(WINDOW, cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_FULLSCREEN)
-        cv2.imshow(WINDOW, np.zeros((CANVAS_H, CANVAS_W, 3), dtype=np.uint8))
+    def __init__(self, title: str = WINDOW) -> None:
+        self.window = title
+        cv2.namedWindow(self.window, cv2.WINDOW_NORMAL)
+        cv2.setWindowProperty(self.window, cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_FULLSCREEN)
+        cv2.imshow(self.window, np.zeros((CANVAS_H, CANVAS_W, 3), dtype=np.uint8))
         cv2.waitKey(50)
-        _, _, w, h = cv2.getWindowImageRect(WINDOW)
+        _, _, w, h = cv2.getWindowImageRect(self.window)
         if w <= 0 or h <= 0:
             w, h = CANVAS_W, CANVAS_H
         self.w, self.h = w, h
@@ -366,12 +376,13 @@ class Screen:
         remaining = max(0.0, test.max_seconds - elapsed)
         cv2.putText(img, f"{int(remaining // 60)}:{int(remaining % 60):02d}",
                     (int(20 * self.scale), self.h - int(20 * self.scale)), font, fs, WHITE, 2)
-        cv2.imshow(WINDOW, img)
+        cv2.imshow(self.window, img)
 
 
 # --- Entry point ---
-def main() -> None:
-    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+def main(build=build_trials, results_dir: str = RESULTS_DIR, sequence: str = "center_out",
+         description: str = __doc__) -> None:
+    parser = argparse.ArgumentParser(description=description, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--calib", required=True, help="Calibration to load, e.g. 'elisa' for calibrations/elisa.npz")
     parser.add_argument("--subject", default="S000", help="Subject id used in the result file names (default: S000)")
     parser.add_argument("--cam", type=int, default=0, help="Webcam index (default: 0)")
@@ -406,14 +417,15 @@ def main() -> None:
         )
     )
 
-    test = ReachingCursorTest(args.subject, args.max_minutes)
-    screen = Screen()
+    test = ReachingCursorTest(args.subject, args.max_minutes, trials=build(load_order()),
+                              results_dir=results_dir, sequence=sequence)
+    screen = Screen(title=f"BoMI - Reaching ({sequence})")
     cursor_filter = bomi.CursorFilter()
     # Map space (BASE_WIDTH x BASE_HEIGHT) -> canvas, same calibration as the robot
     sx, sy = CANVAS_W / bomi.BASE_WIDTH, CANVAS_H / bomi.BASE_HEIGHT
     crs_x, crs_y = bomi.BASE_WIDTH / 2.0, bomi.BASE_HEIGHT / 2.0
 
-    print(f"\n=== CURSOR REACHING === {len(test.trials)} trials, max {args.max_minutes:.0f} min. Q = abort")
+    print(f"\n=== CURSOR REACHING ({sequence}) === {len(test.trials)} goals, max {args.max_minutes:.0f} min. Q = abort")
     test.start(time.time())
     try:
         while not test.end_reason:
@@ -424,7 +436,7 @@ def main() -> None:
             test.update(t, cx, cy)
             screen.draw(test, cx, cy, t, hand_detected)
             key = cv2.waitKey(1) & 0xFF
-            if bomi._quit_requested(key, WINDOW):
+            if bomi._quit_requested(key, screen.window):
                 test.end_reason = "aborted"
     finally:
         summary = test.finish(time.time())

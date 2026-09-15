@@ -167,18 +167,20 @@ Per-trial metrics are computed from `/odom` and recorded both in the bag (`/reac
 
 Other bag topics: `/reaching/target` (current target position), `/reaching/event` (target shown / reached / missed / finished, JSON), `/reaching/status` (progress text), `/reaching/summary` (success rate and mean metrics).
 
-## Cursor reaching test (no robot)
+## Cursor reaching tests (no robot)
 
-[`reachy_bomi/reaching_cursor.py`](reachy_bomi/reaching_cursor.py) runs markerlessBoMI's reaching test on screen: same hand -> cursor chain as the client, but the cursor itself has to reach targets in a fullscreen window. No robot, socket or container involved.
+Two fullscreen tests run markerlessBoMI's reaching test on screen: same hand -> cursor chain as the client, but the cursor itself has to reach targets. No robot, socket or container involved.
 
 ```bash
 cd reachy_bomi
-python3 reaching_cursor.py --calib <name> --subject S001 [--max-minutes 5]
+python3 reaching_center_out.py --calib <name> --subject S001 [--max-minutes 4]
+python3 reaching_random.py     --calib <name> --subject S001 [--max-minutes 4]
 ```
 
-Geometry and sequence follow `main_reaching.py` / `reaching.py` (1200x650 canvas scaled to the screen, home at the centre, target radius 40 px, 11 blocks, all center-out (centre -> target -> centre -> target ..., 248 targets, 496 goals)), with these changes: targets are spread over the **whole canvas** (a seeded random point in each cell of a 6x3 grid, every cell visited before any repeats) instead of a 260 px circle, and the dwell inside a target is **1 s** (original 250 ms). The map's 2550x1500 space is scaled onto the canvas, so the same calibration works here and on the robot. The window shows the target (green ring, blue while the cursor is inside, filled green when reached; a target not reached within 10 s is marked missed and skipped), the score, a `target k/496` counter and the remaining time. The **session timer starts when the centre is reached for the first time** (first goal); the session ends when the sequence is over or after `--max-minutes` (default 4). Score, as in the original: 4/3/2/1 points per target by time from its appearance to entering it (< 2 s / < 3 s / < 4 s / more).
+- [`reaching_center_out.py`](reachy_bomi/reaching_center_out.py): centre -> target -> centre -> target ... (248 targets, 496 goals). Results in `results_center_out/<subject>_center_out_{trials.csv,summary.json}`.
+- [`reaching_random.py`](reachy_bomi/reaching_random.py): one goal at the centre, then the same 248 targets one after the other, no returns to the centre. Results in `results_random/<subject>_random_{trials.csv,summary.json}`. It reuses everything from the center-out script.
 
-Results go to `results/<subject>_{trials.csv,summary.json}` (same per-trial metrics as the robot task, in canvas pixels); a subject with previous sessions gets `<subject>_1`, `<subject>_2`, ... The summary also lists the targets that were not reached (`missed_targets`: trial, grid cell, position, reason).
+Common to both: 1200x650 canvas scaled to the screen (the map's 2550x1500 space is scaled onto it, so the same calibration works here and on the robot), target radius 40 px, targets spread over the **whole canvas** (a seeded random point in each cell of a 6x3 grid, every cell visited before any repeats -- fixed, identical for every participant and launch), dwell **1 s** inside a target, a target not reached within **10 s** is marked missed and skipped. The window shows the target (green ring, blue while the cursor is inside, filled green when reached), the score, a `target k/N` counter and the remaining time. The **session timer starts when the centre is reached for the first time**; the session ends when the sequence is over or after `--max-minutes` (default 4). Score, as in the original: 4/3/2/1 points per target by time from its appearance to entering it (< 2 s / < 3 s / < 4 s / more). A subject with previous sessions gets `_1`, `_2`, ... appended to the file names. The summary lists the targets that were not reached (`missed_targets`: trial, grid cell, position, reason).
 
 ## Scenarios
 
