@@ -2,13 +2,15 @@ import datetime
 import os
 
 from launch import LaunchDescription
-from launch.actions import DeclareLaunchArgument, ExecuteProcess, IncludeLaunchDescription, OpaqueFunction
+from launch.actions import DeclareLaunchArgument, ExecuteProcess, IncludeLaunchDescription, OpaqueFunction, Shutdown
 from launch.launch_description_sources import PythonLaunchDescriptionSource
 from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
 from launch_ros.substitutions import FindPackageShare
 
-from reachy_bomi.scenarios import SCENARIO_NAMES, resolve_world_for_scenario, resolve_bag_prefix_for_scenario
+from reachy_bomi.scenarios import (
+    SCENARIO_NAMES, resolve_world_for_scenario, resolve_bag_prefix_for_scenario, resolve_task_for_scenario,
+)
 
 BAG_OUTPUT_DIR = os.path.expanduser("~/reachy_bomi_bags")
 
@@ -19,6 +21,8 @@ def launch_setup(context, *args, **kwargs):
     record = LaunchConfiguration("record").perform(context).lower() == "true"
 
     world = resolve_world_for_scenario(scenario)
+    task = resolve_task_for_scenario(scenario)
+    bag_prefix = resolve_bag_prefix_for_scenario(scenario)
 
     reachy_sim = IncludeLaunchDescription(
         PythonLaunchDescriptionSource(
@@ -45,18 +49,36 @@ def launch_setup(context, *args, **kwargs):
         cmd_vel_publisher_node,
     ]
 
+    if task == "reaching":
+        # Center-out reaching task. The node exits when the session is over
+        # (all targets done or session time up): on_exit=Shutdown() then stops
+        # the whole launch -- Gazebo, cmd_vel_publisher and the bag recorder.
+        reaching_node = Node(
+            package="reachy_bomi",
+            executable="reaching_task",
+            output="screen",
+            parameters=[{"results_dir": BAG_OUTPUT_DIR, "results_prefix": bag_prefix}],
+            on_exit=Shutdown(),
+        )
+        actions.append(reaching_node)
+
     if record:
-        bag_prefix = resolve_bag_prefix_for_scenario(scenario)
         timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
         bag_output = os.path.join(BAG_OUTPUT_DIR, f"{bag_prefix}_{timestamp}")
         os.makedirs(BAG_OUTPUT_DIR, exist_ok=True)
 
+        topics = ["/tf", "/odom", "/cmd_vel", "/scan"]
+        if task == "reaching":
+            topics += ["/reaching/target", "/reaching/status", "/reaching/event",
+                       "/reaching/trial_result", "/reaching/summary"]
         bag_record = ExecuteProcess(
+            # Default storage (sqlite3): the mcap plugin is not installed in
+            # the Reachy container, and "--storage mcap" made the recorder
+            # exit immediately (code 2) without recording anything.
             cmd=[
                 "ros2", "bag", "record",
-                "--storage", "mcap",
                 "-o", bag_output,
-                "/tf", "/odom", "/cmd_vel", "/scan",
+                *topics,
             ],
             output="screen",
         )

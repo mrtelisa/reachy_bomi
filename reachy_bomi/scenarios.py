@@ -45,3 +45,12 @@ def resolve_bag_prefix_for_scenario(scenario_name: str) -> str:
     if scenario_cfg is None:
         raise KeyError("Invalid scenario")
     return scenario_cfg.get("bag_prefix", scenario_name)
+
+
+def resolve_task_for_scenario(scenario_name: str) -> str:
+    """Optional 'task' of a scenario ('' if none): 'reaching' starts reaching_task."""
+    scenarios = load_scenarios_config()
+    scenario_cfg = scenarios.get(scenario_name)
+    if scenario_cfg is None:
+        raise KeyError("Invalid scenario")
+    return scenario_cfg.get("task", "") or ""

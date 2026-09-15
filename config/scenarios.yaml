@@ -47,3 +47,8 @@ scenarios:
     map_id: 12.0
     world: worlds/final_test.world
     bag_prefix: FinalTest
+  reaching:
+    map_id: 13.0
+    world: worlds/reaching.world
+    bag_prefix: Reaching
+    task: reaching   # starts reaching_task (center-out targets, see config/reaching.yaml)

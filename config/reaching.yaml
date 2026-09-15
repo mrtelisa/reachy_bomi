@@ -1,0 +1,28 @@
+# Center-out reaching task for the Reachy mobile base (see reachy_bomi/reaching_task.py).
+#
+# Targets are placed on circles around `home` (angles 2*pi*i/n + pi/n, like
+# markerlessBoMI's initialize_targets). The sequence alternates peripheral
+# target -> home -> peripheral target -> home ..., and the circle radius grows
+# every `targets_per_distance` targets (circle_radii).
+reaching:
+  n_targets: 8                    # angular positions on each circle (2*pi*i/n + pi/n)
+  circle_radii: [2.0, 4.0, 6.0]   # [m] distance from home; the sequence goes through them in order
+  targets_per_distance: 10        # peripheral targets at each distance (10 at 2 m, 10 at 4 m, 10 at 6 m)
+  home: [0.0, 0.0]                # [m] in the odom/world frame (the robot's spawn pose)
+  target_radius: 0.35             # [m] robot base centre must get within this distance
+  dwell_time: 2.0                 # [s] ...and stay there this long to count as reached
+  trial_timeout: 30.0             # [s] a target not reached within this time is missed
+  session_duration: 300.0         # [s] hard stop measured from the end of the cursor preview
+  seed: 20
+  # Presentation order: one list of angular indices per distance (like
+  # markerlessBoMI's targets/circle_coadapt.txt, the same for every
+  # participant). Omit to draw a fresh shuffle with `seed`.
+  order:
+    - [1, 4, 3, 6, 0, 5, 7, 2, 5, 3]
+    - [2, 1, 6, 4, 7, 0, 6, 4, 1, 7]
+    - [0, 3, 2, 5, 7, 2, 6, 5, 0, 1]
+
+  # Metrics
+  motion_onset_speed: 0.05    # [m/s] first sample above this = movement onset
+  speed_peak_threshold: 0.10  # [m/s] peaks of the speed profile counted above this
+  resample_hz: 50.0           # trajectories are resampled to this rate before differentiating

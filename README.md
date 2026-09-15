@@ -135,6 +135,38 @@ The control area is a 3×3 grid with a dead zone in the centre:
 
 ---
 
+## Reaching task
+
+The `reaching` scenario runs a **center-out reaching test** with the mobile base, ported from markerlessBoMI's reaching test: targets on circles around the robot's start pose (home), presented in a fixed pseudo-random order, alternating peripheral target -> home -> target -> home ... The distance grows every `targets_per_distance` targets: by default 10 targets at 2 m, 10 at 4 m and 10 at 6 m (30 targets, 60 reaches with the home returns). Everything is configured in [`config/reaching.yaml`](config/reaching.yaml) (angular positions, `circle_radii`, `targets_per_distance`, target radius, dwell time, trial timeout, session duration, target order).
+
+```bash
+python3 socket_client.py <robot_ip> --calib <name> --scenario reaching
+```
+
+How it runs ([`reachy_bomi/reaching_task.py`](reachy_bomi/reaching_task.py), started by `bomi_control.launch.py` for scenarios with `task: reaching`):
+
+1. Gazebo loads `worlds/reaching.world`: an empty room with two floor markers (white disc = home, green disc = current target; visual only, no collision).
+2. The node waits for the operator to finish the **cursor preview**: as soon as control starts, the **session timer** (`session_duration`, default 5 min) starts and the first target appears.
+3. A target is reached when the base centre stays within `target_radius` (0.35 m) for `dwell_time` (2 s); one not reached within `trial_timeout` (30 s) is missed and the next one is shown. The cursor map shows the progress (`target 4/32`) in blue at the bottom.
+4. When all targets are done **or the session time is up**, the node exits and the launch shuts everything down (Gazebo, `cmd_vel_publisher`, bag); the client stops on its own.
+
+Per-trial metrics are computed from `/odom` and recorded both in the bag (`/reaching/trial_result`, JSON) and in `~/reachy_bomi_bags/Reaching_<timestamp>_reaching.csv` (+ a `_summary.json`):
+
+| Metric | Meaning |
+|---|---|
+| `reaction_time` | target shown -> movement onset (speed > `motion_onset_speed`) |
+| `movement_time` | movement onset -> last entry into the target |
+| `reach_time` | target shown -> last entry into the target |
+| `success`, `end_reason` | reached / `trial_timeout` / `session_timeout` |
+| `radius`, `distance_block`, `target_number` | distance of the current circle, which distance block (1-3) and which peripheral target (1-30) the trial belongs to |
+| `path_length`, `normalized_path_length` | path / straight-line displacement (1 = perfectly straight) |
+| `max_deviation` | max perpendicular distance from the ideal line onset -> target centre |
+| `dimensionless_jerk`, `log_dimensionless_jerk` | smoothness (Hogan & Sternad 2009) |
+| `n_speed_peaks` | local maxima of the speed profile above `speed_peak_threshold` |
+| `mean_speed`, `peak_speed` | |
+
+Other bag topics: `/reaching/target` (current target position), `/reaching/event` (target shown / reached / missed / finished, JSON), `/reaching/status` (progress text), `/reaching/summary` (success rate and mean metrics).
+
 ## Scenarios
 
 Scenarios are defined in [`config/scenarios.yaml`](config/scenarios.yaml). Each one maps a name to a `map_id`, a Gazebo `world`, and a `bag_prefix` used to name the recording.
@@ -145,6 +177,7 @@ Scenarios are defined in [`config/scenarios.yaml`](config/scenarios.yaml). Each 
 | `train1`–`train4` | `labyrinth1.world`     |
 | `test1`, `test2`  | `mid_tests.world`      |
 | `train5`–`train8` | `labyrinth2.world`     |
+| `reaching`      | `reaching.world` (center-out reaching task, see above) |
 | `final_test`      | `final_test.world`     |
 
 ---

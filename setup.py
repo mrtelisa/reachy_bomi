@@ -24,6 +24,7 @@ setup(
         'console_scripts': [
             'socket_server = reachy_bomi.socket_server:main',
             'cmd_vel_publisher = reachy_bomi.cmd_vel_publisher:main',
+            'reaching_task = reachy_bomi.reaching_task:main',
         ],
     },
 )

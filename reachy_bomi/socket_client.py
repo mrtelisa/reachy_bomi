@@ -63,6 +63,7 @@ import os
 import socket
 import subprocess
 import sys
+import threading
 import time
 import webbrowser
 
@@ -268,10 +269,12 @@ def _quit_requested(key: int, window_name: str) -> bool:
 
 
 def _draw_cursor_map(crs_x: float, crs_y: float, region: int, message: str,
-                      map_width: int = MAP_WINDOW_SIZE[0], map_height: int = MAP_WINDOW_SIZE[1]):
+                      map_width: int = MAP_WINDOW_SIZE[0], map_height: int = MAP_WINDOW_SIZE[1],
+                      status: str = ""):
     """Rectangle representing the BASE_WIDTH x BASE_HEIGHT virtual screen, with
-    the 9-region grid lines, a dot at the current cursor position, and the
-    lin_vel/ang_vel message currently being sent to the robot."""
+    the 9-region grid lines, a dot at the current cursor position, the
+    lin_vel/ang_vel message currently being sent to the robot and, at the
+    bottom, an optional status line from the robot side (reaching task)."""
     canvas = np.full((map_height, map_width, 3), 30, dtype=np.uint8)
     sx = map_width / BASE_WIDTH
     sy = map_height / BASE_HEIGHT
@@ -290,6 +293,10 @@ def _draw_cursor_map(crs_x: float, crs_y: float, region: int, message: str,
                 (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
     cv2.putText(canvas, f"-> PC2: {message}",
                 (10, 50), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
+    if status:
+        # Task feedback from the robot side (e.g. "target 4/32"), bottom-left in blue
+        cv2.putText(canvas, status, (10, map_height - 12),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 140, 0), 2)
     return canvas
 
 
@@ -573,12 +580,41 @@ class RobotSocket:
         self._sock.connect((host, port))
         print(f"[SOCKET] Connected to {host}:{port}")
 
+        # Messages coming back from the robot side (socket_server forwards the
+        # reaching task status as "reaching:<text>"), read on a background thread.
+        self.reaching_status = ""      # e.g. "target 4/32", shown on the cursor map
+        self.reaching_done = False     # True once the robot side reports "done"
+        self._closed = False
+        self._reader = threading.Thread(target=self._read_loop, daemon=True)
+        self._reader.start()
+
     def send(self, msg: str) -> None:
         # '\n' delimiter so socket_server.py can tell separate messages apart
         # even if TCP coalesces/splits them across recv() calls.
         self._sock.sendall((msg + "\n").encode(FORMAT))
 
+    def _read_loop(self) -> None:
+        buffer = ""
+        while not self._closed:
+            try:
+                data = self._sock.recv(1024)
+            except OSError:
+                break
+            if not data:
+                break
+            buffer += data.decode(FORMAT)
+            while "\n" in buffer:
+                line, buffer = buffer.split("\n", 1)
+                line = line.strip()
+                if line.startswith("reaching:"):
+                    text = line[len("reaching:"):].strip()
+                    if text == "done":
+                        self.reaching_done = True
+                    else:
+                        self.reaching_status = text
+
     def close(self) -> None:
+        self._closed = True
         try:
             self.send(DISCONNECT_MESSAGE)
         except OSError:
@@ -782,11 +818,15 @@ def _control_phase(cap, landmarker, bomi_map: BoMIMap, robot: RobotSocket,
 
         if show_cam:
             cv2.imshow(cam_window, frame)
-        cv2.imshow(map_window, _draw_cursor_map(crs_x, crs_y, region, message))
+        cv2.imshow(map_window, _draw_cursor_map(crs_x, crs_y, region, message,
+                                                status=robot.reaching_status))
         _pin_map_window(map_window)
 
         key = cv2.waitKey(1) & 0xFF
         if (show_cam and _quit_requested(key, cam_window)) or _quit_requested(key, map_window):
+            break
+        if robot.reaching_done:
+            print("Task finished on the robot side: stopping control.")
             break
 
     robot.send("lin_vel:0.000 ang_vel:0.000")

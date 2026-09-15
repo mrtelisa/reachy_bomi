@@ -9,7 +9,7 @@ from dataclasses import dataclass
 
 import rclpy
 from rclpy.node import Node
-from std_msgs.msg import Float32
+from std_msgs.msg import Float32, String
 
 from reachy_bomi.scenarios import SCENARIO_NAMES
 
@@ -54,6 +54,12 @@ class ServerSocketNode(Node):
 
         self._scenario_proc = None
 
+        # Connected clients, so messages from the robot side (reaching task
+        # status) can be forwarded back over the same socket.
+        self._conns = []
+        self._conns_lock = threading.Lock()
+        self.create_subscription(String, "/reaching/status", self._reaching_status_cb, 10)
+
         local_ip = get_local_ip()
         self.server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self.server.bind((local_ip, self.port))
@@ -67,6 +73,8 @@ class ServerSocketNode(Node):
         while rclpy.ok():
             conn, addr = self.server.accept()
             self.get_logger().info(f"New connection from {addr}")
+            with self._conns_lock:
+                self._conns.append(conn)
             # This is made to allow that different clients can connect to the server at the 
             # same time, each one in a different thread
             thread = threading.Thread(target=self._handle_client, args=(conn,), daemon=True)
@@ -92,6 +100,9 @@ class ServerSocketNode(Node):
                     if msg == DISCONNECT_MESSAGE:
                         connected = False
         finally:
+            with self._conns_lock:
+                if conn in self._conns:
+                    self._conns.remove(conn)
             conn.close()
             # Whatever the reason the client went away (clean disconnect, closed
             # terminal, dropped connection), stop the scenario it had launched.
@@ -112,6 +123,21 @@ class ServerSocketNode(Node):
 
         if "scenario:" in msg:
             self._launch_scenario(msg)
+
+    def _reaching_status_cb(self, msg: String) -> None:
+        """Forward the reaching task status ("target 4/32", "done") to every
+        connected client, '\n'-delimited like the messages they send us."""
+        self._send_to_clients(f"reaching:{msg.data}")
+
+    def _send_to_clients(self, msg: str) -> None:
+        payload = (msg + "\n").encode(FORMAT)
+        with self._conns_lock:
+            clients = list(self._conns)
+        for conn in clients:
+            try:
+                conn.sendall(payload)
+            except OSError:
+                pass  # the client's own handler thread cleans it up
 
     @staticmethod
     def _extract_float(message: str, key: str) -> float:
