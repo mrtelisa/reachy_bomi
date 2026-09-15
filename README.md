@@ -20,19 +20,21 @@ webcam → MediaPipe → autoencoder cursor → 9-region velocity → reachy2_sd
       torso depth camera → YOLOv8 → point cloud → grasp planning → arm execution
 ```
 
-`reachy_control.py` is the only script with a CLI/`main()` for real robot use — `bomi_teleop.py`, `reachy_detection.py`, `reachy_selection.py`, `reachy_pregrasp.py`, `reachy_grasp.py`, `camera_viewer.py`, `graphs.py`, `stream.py`, and `safety.py` are library modules it's built from. Every other way of running things (mouse-driven grasp, dry runs, single-piece diagnostics) lives under `tests/`, see Usage below.
+`reachy_control.py` is the only script with a CLI/`main()` for real robot use — `bomi_teleop.py`, `reachy_detection.py`, `reachy_selection.py`, `reachy_pregrasp.py`, `reachy_grasp.py`, `camera_viewer.py`, `stream.py`, `safety.py`, `graphs.py` and `session_metrics.py` are library modules it's built from; `calibrate_bomi.py`, `customize_bomi.py` and `load_bomi.py` manage calibrations on their own.
 
 - **`bomi_teleop.py`** — hand tracking → autoencoder cursor → 9-region velocity building blocks (calibration/cursor-preview phases, the BoMI map, cursor filter, velocity helpers). `BoMIMap.save_map_bomi`/`load_map_bomi` (de)serialize a fitted map to/from a `.npz` file; `resolve_calib_path` turns a bare name into a path inside `CALIB_DIR` (a `calibrations/` folder next to the package, created on first save, not tracked by git).
 - **`calibrate_bomi.py`** — standalone tool: run calibration, preview the fitted map live (nothing sent anywhere, no robot needed), then `S` prompts for a name and saves it, `Q` quits without saving. Stays in the preview loop after a cancelled save so you can retry.
 - **`load_bomi.py`** — standalone tool: loads a calibration saved by `calibrate_bomi.py` by name and lets you try it live on the cursor map (again, no robot). Missing name → lists the `.npz` files actually found in `calibrations/`.
+- **`customize_bomi.py`** — standalone tool: rotate/flip/scale/offset a saved calibration live and save it under a new name (no robot).
 - **`reachy_detection.py`** — torso camera → YOLOv8 detection → depth point cloud → grasp geometry building blocks: `capture_and_detect` (grab frame + detect, optionally pre-filtered down to presentable candidates via an injected predicate) and `build_object_point_cloud` (crop/fuse/isolate/measure once an object is confirmed).
-- **`reachy_selection.py`** — hover-to-select/confirm UI on top of `reachy_detection.py`'s boxes: dwell-to-select, a **Repositioning** button, Yes/No confirm, and `presentable_filter` (the reachability/gripper-size pre-filter fed into `capture_and_detect`). Dwelling on Repositioning doesn't act itself — `select_object_to_grasp_bomi` returns the `REPOSITION_REQUESTED` sentinel and lets `reachy_control.py` drive the actual mode switch, so this module never depends back on it. `select_object_to_grasp_bomi`/`confirm_grasp_bomi` drive the UI from the BoMI cursor (used by `reachy_control.py`); `MouseTracker` is a standalone mouse-driven alternative used by `tests/*.py`.
+- **`reachy_selection.py`** — hover-to-select/confirm UI on top of `reachy_detection.py`'s boxes: dwell-to-select, a **Repositioning** button, Yes/No confirm, and `presentable_filter` (the reachability/gripper-size pre-filter fed into `capture_and_detect`). Dwelling on Repositioning doesn't act itself — `select_object_to_grasp_bomi` returns the `REPOSITION_REQUESTED` sentinel and lets `reachy_control.py` drive the actual mode switch, so this module never depends back on it. `select_object_to_grasp_bomi`/`confirm_grasp_bomi` drive the UI from the BoMI cursor.
 - **`reachy_pregrasp.py`** — moves both arms to the pre-grasping posture (non-blocking) and waits for it, showing a progress-bar window while holding the mobile base at zero speed and keeping the BoMI cursor alive.
 - **`reachy_grasp.py`** — grasp planning/execution library: from an `ObjectGeometry` (position, axes, width/height, table normal), computes pre-grasp/grasp/lift end-effector poses and drives the arm through them. Also exposes `is_roughly_reachable`, the cheap single-point reachability check `reachy_selection.py` uses to pre-filter detections.
 - **`camera_viewer.py`** — standalone script that shows a live feed from either the head/teleop camera or the torso/depth camera (`--camera teleop|torso`); spawned by `reachy_control.py` as its own OS process during Control/pre-grasping pose (teleop) and during repositioning (torso), so the camera's network round-trips stay out of the cursor/velocity loop. Its window is moved to a fixed screen position so it lands beside the cursor-map window instead of on top of it.
-- **`graphs.py`** — matplotlib diagnostics (point cloud stages, planned grasp visualization).
-- **`stream.py`** — camera-streaming primitives (non-blocking grab+show, blocking live feed) used by `camera_viewer.py` and, in-process, by `reachy_control.py`'s look-before-you-grasp checkpoint right before a grasp executes.
+- **`stream.py`** — blocking camera live feed used by `camera_viewer.py`.
+- **`graphs.py`** — matplotlib diagnostics (point cloud stages, planned grasp); the calls are commented out in `reachy_detection.py`/`reachy_control.py`, uncomment to inspect.
 - **`safety.py`** — quit/shutdown safety net: a local `quit_requested` check (Q/ESC or window closed, while a cv2 window has focus) plus an OS-level global watcher (`pynput`, works regardless of focus, even mid-`arm.goto`) that triggers `emergency_shutdown`.
+- **`session_metrics.py`** — session metrics (durations, path lengths, region shares, dwells, objects moved) written to `results_robot/` at the end of every `reachy_control.py` run.
 
 Dependencies between these run one way only, with no cycles: `reachy_grasp.py`/`bomi_teleop.py` have no dependency on the rest, `reachy_detection.py` depends only on `reachy_grasp.py` (for the shared `ObjectGeometry` type), `reachy_selection.py` depends on both, and `reachy_control.py` ties everything together.
 
@@ -111,7 +113,7 @@ ros2 run reachy_bomi reachy_control [robot_ip] [--cam 0] [--model hand_landmarke
 
 **Phase 4.5 — Repositioning (opened from object selection):** dwelling on the **Repositioning** button for `REPOSITIONING_HOVER_SECONDS` hands off to `reachy_control.repositioning_navigation`, which reuses the same 9-region cursor UI as Control but caps velocity to `bomi_teleop.MIN_LINEAR`/`MIN_ANGULAR` only (no ramp-up), and streams the **torso/depth camera** instead of the head one (`camera_viewer.py --camera torso`), so you can see what you're driving toward. A cursor-preview sub-phase runs first (nothing sent) until the cursor is re-centered; holding it centered again for `SELECTION_HOLD_SECONDS` stops the base and returns to object selection with a **freshly recaptured** frame (the robot has moved, so the old detections/point positions no longer apply).
 
-ESC/Q stop the robot from *any* window (including a `graphs.py` plot) or the terminal, at any point — see `safety.py`.
+ESC/Q stop the robot from *any* window or the terminal, at any point — see `safety.py`.
 
 ### Session metrics
 
@@ -144,19 +146,6 @@ python3 reachy_bomi/load_bomi.py NAME [--cam 0] [--model hand_landmarker.task]
 
 `calibrate_bomi.py` runs the same calibration phase as `reachy_control.py`, fits the map, then previews it live (cursor map only, nothing sent): move your hand to check it feels right, `S` prompts for a name and saves to `calibrations/<name>.npz` (staying in the preview loop if you cancel with a blank name), `Q` quits without saving. `customize_bomi.py NAME` loads a saved map and lets you rotate/flip/scale/offset it live (`[ ]`, `i`/`o`, `-`/`=`, `hjkl`, `r` resets), saving the result under a new name with `S`. `load_bomi.py NAME` loads a file back and shows the same live preview, so you can sanity-check a saved calibration before trusting it. All of them resolve `NAME` the same way `reachy_control.py --calib NAME` does (`bomi_teleop.resolve_calib_path`), so a name saved with one is usable by all three.
 
-### Everything else — `tests/`
-
-Standalone scripts: dry runs, mouse-driven equivalents, and single-piece diagnostics, none of them needing the full calibration → teleop → grasp flow above to exercise one part of the pipeline:
-
-| Script | What it does |
-|---|---|
-| `test_teleop.py` | `bomi_teleop.py`'s hand-tracking → velocity pipeline, logged instead of sent (no robot needed) |
-| `test_navigation.py` | `reachy_control.py`'s calibration → cursor → pre-grasping-pose flow, fully self-contained (no robot, no depth camera, no YOLO) |
-| `test_object_dimensions.py` | Live YOLO + depth size estimation only (robot arms/base never power on) |
-| `test_reachability.py` | Whether a single pasted 4×4 end-effector pose is IK-reachable for one arm, and moves there if so — isolates a rejection from the rest of the grasp-planning pipeline |
-| `test_grasp.py` | Mouse-driven select → confirm → plan → execute grasp flow (the counterpart to `reachy_selection.py`'s BoMI-cursor-driven `select_object_to_grasp_bomi`/`confirm_grasp_bomi`), starting both arms directly in the `elbow_135` posture |
-| `test_stream_camera.py` | Head-camera live feed via `reachy2_sdk` directly, no `camera_viewer.py` subprocess — currently a rough/incomplete scratch script, not runnable as-is |
-
 ---
 
 ## Package layout
@@ -176,15 +165,13 @@ reachy_bomi/
 │   ├── reachy_pregrasp.py           # library: pre-grasping-pose goto + wait-with-progress-bar UI
 │   ├── reachy_grasp.py              # library: grasp planning/execution (pose math, IK search, execute_grasp)
 │   ├── camera_viewer.py             # standalone script: head or torso camera live feed (--camera), spawned by reachy_control.py as its own process
-│   ├── graphs.py                    # library: matplotlib diagnostics (point cloud stages, grasp plan visualization)
 │   ├── stream.py                    # library: camera-streaming primitives (torso + teleop cameras)
+│   ├── graphs.py                    # library: matplotlib diagnostics (point cloud stages, grasp plan), calls commented out
 │   ├── safety.py                    # library: quit/shutdown safety net (local check + OS-level global watcher)
-│   ├── yolov8n.pt                   # YOLOv8 weights (auto-downloaded by ultralytics on first run)
-│   └── tests/                       # standalone scripts (mouse-driven grasp, dry runs, diagnostics), see Usage above
+│   └── yolov8n.pt                   # YOLOv8 weights (auto-downloaded by ultralytics on first run)
 ├── calibrations/                     # saved BoMIMap .npz files (created on first save, not tracked by git)
 ├── results_robot/                    # session metrics JSON files (created on first run, not tracked by git)
 ├── hand_landmarker.task              # MediaPipe model (download separately, see Requirements)
-├── reachy_vel.py                     # standalone script: manual mobile-base velocity/lidar-safety-distance calibration, not part of the package
 ├── resource/
 │   └── reachy_bomi                  # ament resource marker
 ├── package.xml
@@ -195,6 +182,6 @@ reachy_bomi/
 ```
 
 ## Known limitations
-- Requires a functioning webcam on the machine running `reachy_control.py` (or the teleop-only `tests/test_teleop.py`).
+- Requires a functioning webcam on the machine running `reachy_control.py`.
 - Grasp planning only handles round objects (`cylinder`/`sphere` shapes in `reachy_detection.SHAPE_BY_CLASS`) — a box's hidden depth can't be recovered from a single camera view the same way.
 - The operator's PC and the robot just need network (IP) reachability to each other — no ROS 2 distro matching is required, since communication goes through `reachy2_sdk`'s gRPC interface.

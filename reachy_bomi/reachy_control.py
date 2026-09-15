@@ -1,81 +1,25 @@
 #!/usr/bin/env python3
 """
-BoMI teleop + grasp for Reachy2: entry point that drives bomi_teleop.py,
-reachy_detection.py, reachy_selection.py and reachy_grasp.py through a
-single hand-tracked PCA cursor. Driving the mobile base and hovering YOLO
-boxes/buttons in the grasp UI both use that same cursor.
-
-Runs entirely on a single PC with a webcam and network access to the robot;
-mediapipe/opencv/ultralytics computation and the reachy2_sdk client live in
-the same process.
-
-Dependencies:
-    pip install reachy2-sdk mediapipe opencv-python tensorflow numpy scipy ultralytics matplotlib pynput
+BoMI teleop + grasp for Reachy2: the entry point. One hand-tracked cursor
+(bomi_teleop) drives the mobile base, then the object selection / grasp UI
+(reachy_detection, reachy_selection, reachy_grasp) over reachy2_sdk.
 
 Usage:
-    python3 reachy_control.py [robot_ip]
+    python3 reachy_control.py [robot_ip] [--cam 0] [--model PATH] [--yolo-model PATH]
+                              [--conf 0.5] [--calib NAME] [--subject ID]
 
-    <robot_ip> is optional; if omitted, DEFAULT_ROBOT_IP (in bomi_teleop.py) is used.
-
-    Options:
-        --cam INDEX          Webcam index. Default: 0
-        --model PATH         Path to the MediaPipe hand_landmarker.task model.
-        --yolo-model PATH    YOLOv8 weights (.pt). Default: yolov8n.pt
-        --conf FLOAT         Minimum YOLO detection confidence. Default: 0.5
-        --calib NAME         Saved calibration to load (skips the calibration phase).
-        --subject ID         Subject id for the session metrics file. Default: S000
-
-Session metrics (session_metrics.py) are written to results_robot/<subject>_session.json
-at the end of every run: test/navigation durations, repositioning count, objects
-moved, base path lengths per driving mode (+ normalized to
-session_metrics.DEFAULT_OPTIMAL_PATH_LENGTH, to be set before the session), the
-log dimensionless jerk of the navigation, the share of driving time spent in
-each of the 9 regions and how many dwells were done / declined.
-
-Camera streaming: Phase 3.5 and 4 spawn camera_viewer.py as their own OS process.
-
-Phases 1-2 (Calibration, Cursor preview): see bomi_teleop.py.
-
-Phase 3 - Control:
-    Hand movement -> PCA cursor -> 9-region velocity -> mobile base, exactly
-    as in bomi_teleop.py. Hold the cursor centered (region 5) for
-    SELECTION_HOLD_SECONDS straight to move the arms into a pre-grasping pose.
-
-Phase 3.5 - Pre-grasping pose (opened from Control):
-    Both arms move to a pre-grasping posturethe base is held at zero
-    speed. Once arms are in place, the cursor/9-region map reappears
-    (same as Control); holding the cursor centered (region 5) for 
-    SELECTION_HOLD_SECONDS straight resumes Control with linear/angular velocities 
-    halved. Hold it centered to stop the base and open object selection.
-
-Phase 4 - Object selection / grasp (opened from Control):
-    Capture -> hover-to-select -> Yes/No confirm, see reachy_selection.py
-    (select_object_to_grasp_bomi/confirm_grasp_bomi), every hover point being
-    the BoMI cursor. Answering "No" re-offers hover-select on the same capture.
-    Confirming "Yes" plans the pick for BOTH arms (plan_grasps_by_arm) and
-    moves to _resolve_and_confirm_place_point: dwell-pick a placement point
-    on a fixed reachability grid (select_place_location_bomi, e.g. inside a
-    box), showing the union of what each arm that can pick this object up
-    could then do with it -- unreachable cells are shown red and never
-    accumulate dwell, and the confirmed cell is what decides which arm does
-    the job. Then a second Yes/No confirm (confirm_place_bomi) on the point
-    itself -- "No" re-offers point selection, quitting at either step aborts
-    the object (nothing has been grasped yet). Once both are confirmed,
-    plan_grasp/plan_place are re-run fresh right before moving (the grid's
-    own IK checks can otherwise leave the original plan no longer solvable --
-    see _build_place_grid's docstring), then execute_grasp actually moves the
-    arm; _place_object then lowers the object at the confirmed point and
-    _retract_after_place retracts both arms to the
-    pre-grasping posture (elbow pitch -135 deg). A final Yes/No dwell
-    (confirm_new_object_bomi) then asks whether to pick another object:
-    "Yes" loops back to a fresh capture; "No" (or quitting there) runs
-    _finish_session (back up, rotate 180 deg, return to default posture).
-    If execute_grasp/_place_object itself fails (unreachable pose or a
-    RuntimeError mid-motion), _abort_and_shutdown reports it, backs the base
-    up and rotates it, and powers the robot off right away instead of
-    pretending the run can continue. Quitting anywhere else just ends the
-    run with no explicit wind-down; either way, main()'s finally block
-    powers everything off (a no-op if _abort_and_shutdown already did).
+Phases:
+  1. Calibration (skipped with --calib) and 2. cursor preview: see bomi_teleop.
+  3. Control: cursor -> 9-region velocity -> mobile base. A dwell in region 5
+     asks "continue on the pipeline?": Yes moves the arms to the pre-grasp pose
+     and resumes Control at reduced speed; a second dwell + Yes opens object
+     selection.
+  4. Object selection / grasp: capture -> hover-select -> confirm -> pick a
+     place point -> confirm -> grasp -> place, then "pick another object?".
+     Repositioning (slow driving with the torso camera) can be requested from
+     the selection screen. No at the end runs _finish_session; a failed
+     grasp/place runs _abort_and_shutdown. main()'s finally block always powers
+     the robot off and writes the session metrics (session_metrics.py).
 """
 
 import argparse
@@ -86,8 +30,7 @@ import sys
 import time
 from typing import Optional
 
-# Force XWayland so cv2's fullscreen/topmost window hints actually work (must be
-# set before cv2 creates a window; camera_viewer.py inherits this too)
+# XWayland: cv2's fullscreen/topmost hints only work there (inherited by camera_viewer.py)
 os.environ.setdefault("QT_QPA_PLATFORM", "xcb")
 
 import cv2
@@ -98,70 +41,52 @@ from mediapipe.tasks.python.vision.core import vision_task_running_mode
 from reachy2_sdk import ReachySDK
 from ultralytics import YOLO
 
-import graphs
 import reachy_detection
 import reachy_grasp
 import reachy_pregrasp
 import reachy_selection
 import safety
 import bomi_teleop
+import graphs
 import session_metrics
 
-# Placeholder — replace with the robot's actual IP
 DEFAULT_ROBOT_IP = "192.168.0.121"
 
-# How long the cursor must stay in region 5 before Control moves to the next step
 SELECTION_HOLD_SECONDS = reachy_selection.DWELL_HOLD_SECONDS
 
-# Linear/angular velocity multiplier for Control once the arms are in the
-# pre-grasping pose
-HALVED_SPEED_FACTOR = 0.75 # max_lin = 0.375 [m/s], max_ang = 0.825 [rad/s] 
+HALVED_SPEED_FACTOR = 0.75   # velocity multiplier once the arms are in the pre-grasp pose
 
-# Neck pitch on power-on, applied on top of the "default" posture (whose own
-# neck pitch is -10 deg, i.e. looking slightly up) -- negative = look down.
-STARTUP_GAZE_PITCH_DEG = -20.0 
+STARTUP_GAZE_PITCH_DEG = -20.0   # neck pitch on power-on (negative = look down)
 
-# How far the base translates backward before rotating 180 deg at the end of
-# a successful grasp -- positive = backward
-REVERSE_BASE_CM = 20.0 # TODO find the right value
+REVERSE_BASE_CM = 20.0   # backward translation before the final 180 deg rotation
 
-# camera_viewer.py (head camera, LEFT eye), spawned as its own process by
-# start_camera_viewer during Control/pre-grasping pose
 CAMERA_VIEWER_SCRIPT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "camera_viewer.py")
 
-# global param to let _on_emergency_quit/main()'s block work,
-# however deep in the call stack the quit was triggered from.
 # Latches True the first time object selection opens and never clears: from
-# that point on the robot is working next to the table, so any shutdown --
-# ESC/Q included -- has to back the base away and rotate it before the arms
-# fold in, not just power off where it stands. Before that it's only driving
-# around, with nothing to back away from.
+# then on the robot is next to the table, so any shutdown (ESC/Q included)
+# must back the base away and rotate it before the arms fold in.
 _grasp_phase_entered = False
-_camera_viewer_proc: Optional[subprocess.Popen] = None # head-camera-viewer subprocess, if one is currently running
-# Session metrics (durations, path lengths, objects moved, ...), created in
-# main() and fed by the control loops below; see session_metrics.py.
-_metrics: Optional[session_metrics.SessionMetrics] = None
+_camera_viewer_proc: Optional[subprocess.Popen] = None
+_metrics: Optional[session_metrics.SessionMetrics] = None   # session metrics, created in main()
 
 
 def _sample_odometry(mobile_base, mode: str) -> None:
-    """Feed the base odometry to the session metrics (no-op if the base is
-    off or the SDK call fails)."""
+    """Feed the base odometry to the session metrics. A failed read (base off,
+    gRPC hiccup) is reported and skipped, never fatal."""
     if _metrics is None:
         return
     try:
         _metrics.sample(mobile_base.get_current_odometry(degrees=False), mode)
-    except Exception as exc:  # odometry unavailable (base off, gRPC hiccup): skip this sample
+    except Exception as exc:
         print(f"[metrics] odometry read failed: {exc}")
 
 
 # --- Windows and camera streaming functions ---
 def bring_window_to_front(window_name: str, pos: tuple = None) -> None:
-    """Pins a cv2 window on top of every other window, staying pinned
-    so the window stays visible in front of the camera-viewer subprocess windows.
-    Qt backend only; a harmless no-op elsewhere. pos, if given, moves the
-    window to a fixed (x, y) screen position first."""
+    """Create a cv2 window pinned on top of every other window (so it stays
+    visible over the camera-viewer subprocess windows), optionally moved to pos."""
     cv2.namedWindow(window_name)
-    cv2.imshow(window_name, np.zeros((300, 510, 3), dtype="uint8"))  # match draw_cursor_map's size, or the move below gets undone
+    cv2.imshow(window_name, np.zeros((300, 510, 3), dtype="uint8"))  # draw_cursor_map's size
     cv2.waitKey(1)
     if pos is not None:
         cv2.moveWindow(window_name, *pos)
@@ -169,22 +94,19 @@ def bring_window_to_front(window_name: str, pos: tuple = None) -> None:
 
 
 def make_window_fullscreen(window_name: str) -> None:
-    """Creates (or resizes) a cv2 window, pins it fullscreen and brings it to the
-    front. Re-call this on every newly captured frame -- other windows (e.g. the
-    editor) can otherwise steal focus over it while repositioning runs."""
+    """Create (or resize) a cv2 window fullscreen and on top. Re-called on every
+    new capture, since other windows can steal the focus in the meantime."""
     cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
-    # A window needs at least one rendered frame before FULLSCREEN sticks
-    cv2.imshow(window_name, np.zeros((2, 2, 3), dtype="uint8"))
+    cv2.imshow(window_name, np.zeros((2, 2, 3), dtype="uint8"))  # FULLSCREEN only sticks after a first frame
     cv2.waitKey(1)
     cv2.setWindowProperty(window_name, cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_FULLSCREEN)
-    safety.force_fullscreen(window_name)  # some Qt builds ignore the request above; ask the WM directly too
+    safety.force_fullscreen(window_name)
     cv2.setWindowProperty(window_name, cv2.WND_PROP_TOPMOST, 1)
 
 
 def start_camera_viewer(robot_ip: str, camera: str = "teleop") -> None:
-    """Spawns camera_viewer.py as its own OS process and returns
-    immediately -- keeps its network round-trips (Camera.get_frame) out
-    of this process's own loops. camera is "teleop" (head) or "torso" (chest/depth)."""
+    """Spawn camera_viewer.py ("teleop" = head camera, "torso" = depth camera) as
+    its own OS process, so its network round-trips stay out of this loop."""
     global _camera_viewer_proc
     _camera_viewer_proc = subprocess.Popen(
         [sys.executable, CAMERA_VIEWER_SCRIPT, robot_ip, "--camera", camera]
@@ -201,12 +123,11 @@ def stop_camera_viewer() -> None:
 # --- Grasping flow ---
 def _run_grasp_mode(cap, landmarker, bomi_map, cursor_filter, depth_cam, model, confidence, reachy, crs_x, crs_y,
                      mobile_base, robot_ip):
-    """capture -> hover-select -> confirm -> pick a place point -> confirm ->
-    grasp -> place for one object, then asks whether to pick another (fresh
-    capture, loop) or end the session (back up + rotate + return to default,
-    letting main()'s finally block power everything off). Any "No"/quit along
-    the way, other than the post-place prompt, just ends the run with no
-    explicit wind-down -- main()'s finally block handles that generically."""
+    """Object selection / grasp loop for one object at a time: capture ->
+    hover-select -> confirm -> pick a place point -> confirm -> grasp -> place,
+    then "pick another object?" (Yes: fresh capture and loop, No: _finish_session).
+    Repositioning can be requested from the selection screen. Quitting anywhere
+    else just ends the run; main()'s finally block handles the shutdown."""
     global _grasp_phase_entered
     _grasp_phase_entered = True
     if _metrics is not None:
@@ -255,32 +176,26 @@ def _run_grasp_mode(cap, landmarker, bomi_map, cursor_filter, depth_cam, model, 
             mobile_base.turn_off()
             geometry = reachy_detection.build_object_point_cloud(depth_cam, class_name, box)
             if geometry is None:
-                break  # user quit while the point cloud was being built
+                break
             print(f"[{class_name}] estimated width={geometry.width_m * 100:.1f}cm  "
                   f"height={geometry.height_m * 100:.1f}cm")
 
-            # Plan for BOTH arms, not just one: the placement grid shows the
-            # union of what each can do with this object, and the spot the
-            # user picks is what decides which arm actually does the job.
+            # Plan for both arms: the placement cell the user picks decides which arm is used
             grasp_plans = reachy_grasp.plan_grasps_by_arm(reachy, geometry)
             if not grasp_plans:
                 print(f"[{class_name}] no feasible grasp (too wide for the gripper, "
                       "out of reach, or its pose couldn't be estimated)")
                 break
 
-            #graphs.show_grasp_plan(geometry, next(iter(grasp_plans.values())))
+            #graphs.show_grasp_plan(geometry, next(iter(grasp_plans.values())))  # diagnostic plot
             target_point, place_arm, crs_x, crs_y = _resolve_and_confirm_place_point(
                 cap, landmarker, bomi_map, cursor_filter, crs_x, crs_y,
                 depth_cam, reachy, grasp_plans, geometry,
             )
             if target_point is None:
-                break  # user quit instead of confirming a placement point
+                break
 
-            # Both confirmations are done and nothing has been grasped yet --
-            # only now bring up the head-camera live feed and get the
-            # torso/depth window out of the way, so it's actually visible
-            # while the arm moves instead of sitting hidden behind the
-            # topmost/fullscreen CAM_WINDOW_NAME until it's destroyed anyway.
+            # Head-camera feed while the arm moves, torso window out of the way
             safety.destroy_window(reachy_detection.CAM_WINDOW_NAME)
             start_camera_viewer(robot_ip)
 
@@ -302,15 +217,13 @@ def _run_grasp_mode(cap, landmarker, bomi_map, cursor_filter, depth_cam, model, 
                 cap, landmarker, bomi_map, cursor_filter, crs_x, crs_y,
             )
             if want_new_object is None:
-                break  # quit -- main()'s finally block handles safe shutdown
+                break
             if not want_new_object:
                 if _metrics is not None:
                     _metrics.end_test("finished")   # the user does not want more objects: test over
                 _finish_session(reachy, mobile_base)
                 break
 
-            # Yes -> loop back for a new object, on a fresh capture. The base
-            # was turned off above to hold still during the grasp/place.
             mobile_base.turn_on()
             make_window_fullscreen(reachy_detection.CAM_WINDOW_NAME)
             captured = reachy_detection.capture_and_detect(
@@ -324,124 +237,18 @@ def _run_grasp_mode(cap, landmarker, bomi_map, cursor_filter, depth_cam, model, 
 
         return crs_x, crs_y
     finally:
-        # In the finally so it also runs if something raises its way out of
-        # here; tolerant of the window already being gone either way.
         safety.destroy_window(reachy_detection.CAM_WINDOW_NAME)
-
-
-# Superseded by _place_and_wind_down below -- kept for reference/rollback
-# while the box-placement flow is still being tuned.
-# def _place_back_and_wind_down(reachy, mobile_base, plan: reachy_grasp.GraspPlan) -> None:
-#     """Runs once, right after a successful grasp+lift: puts the object back
-#     where it was picked up from and retreats to pregrasp. Then the base translates,
-#     rotates and evetually returns to the default posture"""
-#     reachy_grasp.place_back(reachy, plan)
-#
-#     if reachy.head is not None:
-#         reachy.head.goto_posture(duration=1.0, wait=False)
-#         stop_camera_viewer() # no-op if already stopped (Phase 4 switch stops it itself)
-#
-#     print(f"\nRetracting both arms to the pre-grasping posture "
-#           f"(elbow pitch {reachy_pregrasp.PRE_GRASP_ELBOW_PITCH_DEG:.0f} deg)...")
-#     goto_ids = reachy_pregrasp.goto_pre_grasp_pose(reachy)
-#     while not all(reachy.is_goto_finished(goto_id) for goto_id in goto_ids):
-#         time.sleep(0.1)
-#
-#     print(f"\nRotating the base {safety.SHUTDOWN_ROTATION_DEG:.0f} deg...")
-#     # Goes through the shared gate so a concurrent ESC-triggered shutdown
-#     # (racing on another thread) can't also rotate the base a second time.
-#     safety.rotate_base_once(mobile_base, reverse_cm=REVERSE_BASE_CM)
-#
-#     print("\nReturning to default posture...")
-#     reachy.goto_posture("default", duration=3.0, wait=True)
-
-
-# Superseded by _resolve_and_confirm_place_plan below, now that the place
-# point is chosen+confirmed *before* execute_grasp instead of after the lift
-# -- kept for reference/rollback while the box-placement flow is tuned.
-# def _resolve_place_plan(
-#     cap, landmarker, bomi_map, cursor_filter, crs_x, crs_y,
-#     depth_cam, reachy, plan: reachy_grasp.GraspPlan, geometry: reachy_grasp.ObjectGeometry,
-# ) -> tuple:
-#     """Dwell-selects a placement point (reachy_selection.select_place_location_bomi),
-#     retrying while the chosen point turns out unreachable for plan.arm_name.
-#     Returns (place GraspPlan, crs_x, crs_y), or (None, crs_x, crs_y) if the
-#     user quit instead of picking a point."""
-#     while True:
-#         target_point, crs_x, crs_y = reachy_selection.select_place_location_bomi(
-#             cap, landmarker, bomi_map, cursor_filter, crs_x, crs_y, depth_cam,
-#         )
-#         if target_point is None:
-#             return None, crs_x, crs_y
-#         place_plan = reachy_grasp.plan_place(reachy, plan, geometry.height_m, geometry.table_normal, target_point)
-#         if place_plan is not None:
-#             return place_plan, crs_x, crs_y
-#         print("[place] that point isn't reachable for the arm -- pick another spot")
-#
-#
-# def _place_in_box_and_wind_down(
-#     cap, landmarker, bomi_map, cursor_filter, crs_x, crs_y,
-#     depth_cam, reachy, mobile_base, plan: reachy_grasp.GraspPlan, geometry: reachy_grasp.ObjectGeometry,
-# ) -> tuple:
-#     """Runs once, right after a successful grasp+lift: lets the user
-#     dwell-pick where to set the object down (e.g. inside a box) and lowers it
-#     there, falling back to place_back at the original pickup spot if the user
-#     quits instead of picking a point. Then the arms retract, the base
-#     translates and rotates, and Reachy returns to the default posture, same
-#     tail as the old _place_back_and_wind_down. Returns (crs_x, crs_y)."""
-#     place_plan, crs_x, crs_y = _resolve_place_plan(
-#         cap, landmarker, bomi_map, cursor_filter, crs_x, crs_y, depth_cam, reachy, plan, geometry,
-#     )
-#     if place_plan is None:
-#         print("[place] no placement point chosen -- placing back at the pickup spot instead")
-#         reachy_grasp.place_back(reachy, plan)
-#     else:
-#         arm = getattr(reachy, place_plan.arm_name)
-#         arm.goto(place_plan.pregrasp_matrix, duration=reachy_grasp.ARM_GOTO_DURATION_S, wait=True)
-#         reachy_grasp.place_back(reachy, place_plan)
-#
-#     if reachy.head is not None:
-#         reachy.head.goto_posture(duration=1.0, wait=False)
-#         stop_camera_viewer() # no-op if already stopped (Phase 4 switch stops it itself)
-#
-#     print(f"\nRetracting both arms to the pre-grasping posture "
-#           f"(elbow pitch {reachy_pregrasp.PRE_GRASP_ELBOW_PITCH_DEG:.0f} deg)...")
-#     goto_ids = reachy_pregrasp.goto_pre_grasp_pose(reachy)
-#     while not all(reachy.is_goto_finished(goto_id) for goto_id in goto_ids):
-#         time.sleep(0.1)
-#
-#     print(f"\nRotating the base {safety.SHUTDOWN_ROTATION_DEG:.0f} deg...")
-#     # Goes through the shared gate so a concurrent ESC-triggered shutdown
-#     # (racing on another thread) can't also rotate the base a second time.
-#     safety.rotate_base_once(mobile_base, reverse_cm=REVERSE_BASE_CM)
-#
-#     print("\nReturning to default posture...")
-#     reachy.goto_posture("default", duration=3.0, wait=True)
-#
-#     return crs_x, crs_y
 
 
 def _resolve_and_confirm_place_point(
     cap, landmarker, bomi_map, cursor_filter, crs_x, crs_y,
     depth_cam, reachy, grasp_plans: dict, geometry: reachy_grasp.ObjectGeometry,
 ) -> tuple:
-    """Builds the reachability grid once (reachy_selection.build_place_grid,
-    which IK-checks every cell for every arm in grasp_plans -- unreachable
-    cells are shown red and can't be dwelled on, so there's no separate "not
-    reachable" retry needed here), then dwell-selects a placement point on it
-    and asks a Yes/No dwell confirm (reachy_selection.confirm_place_bomi).
-    "No" re-offers that same already-computed grid rather than paying for the
-    IK search again. Runs entirely before execute_grasp, so nothing has been
-    physically grasped yet: quitting at either step just aborts, nothing to
-    place back.
-
-    Returns the raw target point plus the arm that can serve it, not a ready
-    GraspPlan: the caller should re-run plan_grasp/plan_place for that arm
-    right before moving (see reachy_selection._build_place_grid's docstring
-    for why -- the grid's own IK checks can leave an earlier plan no longer
-    solvable).
-    Returns (confirmed target point, arm_name, crs_x, crs_y), or
-    (None, None, crs_x, crs_y) if the user quit instead of confirming."""
+    """Build the placement grid once (every cell IK-checked per arm: unreachable
+    cells are red and cannot be dwelled on), dwell-select a cell and ask a
+    Yes/No confirm; "No" re-offers the same grid. Returns the raw target point
+    and the arm that serves it -- not a plan: the caller re-plans right before
+    moving. (None, None, crs_x, crs_y) on quit; nothing has been grasped yet."""
     grid = reachy_selection.build_place_grid(depth_cam, reachy, grasp_plans, geometry)
     if grid is None:
         return None, None, crs_x, crs_y
@@ -460,28 +267,20 @@ def _resolve_and_confirm_place_point(
             return None, None, crs_x, crs_y
         if decision:
             return target_point, place_arm, crs_x, crs_y
-        # decision is False -> back to picking a point
 
 
-# reachy2_sdk's IK solver appears to seed its search from the last computed
-# solution, so a pose plan_grasp/plan_place just validated can still
-# occasionally fail execute_grasp's own re-check moments later, after only a
-# couple more unrelated IK checks (plan_place's own 3 for the confirmed
-# point) -- re-running plan_grasp from scratch usually finds an equally
-# valid alternative right away, so retry the whole cycle a few times before
-# giving up.
+# reachy2_sdk's IK seeds its search from the last solution, so a pose that
+# plan_grasp/plan_place just validated can still fail execute_grasp's own
+# re-check a few IK calls later; re-planning from scratch usually finds an
+# alternative right away, so the whole cycle is retried a few times.
 MAX_GRASP_ATTEMPTS = 3
 
 
 def _replan_and_execute_grasp(reachy, geometry, target_point, arm_name: str) -> tuple:
-    """Repeats plan_grasp -> plan_place -> execute_grasp up to
-    MAX_GRASP_ATTEMPTS times (see its comment for why), all pinned to
-    arm_name -- the arm the confirmed placement cell needs, which is what
-    settled the left/right choice. execute_grasp only starts moving once its
-    own IK pre-check passes for all 3 poses, so a failed attempt here never
-    leaves the arm mid-motion -- safe to just retry with a fresh plan.
-    Returns (plan, place_plan) from whichever attempt succeeded, or
-    (None, None) if every attempt failed."""
+    """plan_grasp -> plan_place -> execute_grasp for arm_name (the arm the chosen
+    placement cell needs), up to MAX_GRASP_ATTEMPTS. execute_grasp only moves
+    once its IK pre-check passes, so a failed attempt never leaves the arm
+    mid-motion. Returns (plan, place_plan), or (None, None) if all attempts failed."""
     for attempt in range(1, MAX_GRASP_ATTEMPTS + 1):
         plan = reachy_grasp.plan_grasp(reachy, geometry, arm_name=arm_name)
         if plan is None:
@@ -495,50 +294,16 @@ def _replan_and_execute_grasp(reachy, geometry, target_point, arm_name: str) -> 
     return None, None
 
 
-# Split into _place_object/_retract_after_place/_finish_session below, now
-# that a successful placement is followed by a "pick another object?" prompt
-# instead of always ending the session -- kept for reference/rollback.
-# def _place_and_wind_down(reachy, mobile_base, place_plan: reachy_grasp.GraspPlan) -> None:
-#     """Runs once, right after a successful grasp+lift, with place_plan already
-#     chosen and confirmed: moves to its pre-place hover, lowers the object
-#     there and opens the gripper (place_back), then retracts both arms,
-#     rotates the base, and returns to the default posture -- same tail as the
-#     old _place_back_and_wind_down."""
-#     arm = getattr(reachy, place_plan.arm_name)
-#     arm.goto(place_plan.pregrasp_matrix, duration=reachy_grasp.ARM_GOTO_DURATION_S, wait=True)
-#     reachy_grasp.place_back(reachy, place_plan)
-#
-#     if reachy.head is not None:
-#         reachy.head.goto_posture(duration=1.0, wait=False)
-#         stop_camera_viewer() # no-op if already stopped (Phase 4 switch stops it itself)
-#
-#     print(f"\nRetracting both arms to the pre-grasping posture "
-#           f"(elbow pitch {reachy_pregrasp.PRE_GRASP_ELBOW_PITCH_DEG:.0f} deg)...")
-#     goto_ids = reachy_pregrasp.goto_pre_grasp_pose(reachy)
-#     while not all(reachy.is_goto_finished(goto_id) for goto_id in goto_ids):
-#         time.sleep(0.1)
-#
-#     print(f"\nRotating the base {safety.SHUTDOWN_ROTATION_DEG:.0f} deg...")
-#     # Goes through the shared gate so a concurrent ESC-triggered shutdown
-#     # (racing on another thread) can't also rotate the base a second time.
-#     safety.rotate_base_once(mobile_base, reverse_cm=REVERSE_BASE_CM)
-#
-#     print("\nReturning to default posture...")
-#     reachy.goto_posture("default", duration=3.0, wait=True)
-
-
 def _place_object(reachy, place_plan: reachy_grasp.GraspPlan) -> bool:
-    """Moves straight above place_plan's target, descends straight down to
-    it, opens the gripper, and retreats straight back up -- reachy_grasp.execute_place,
-    all cartesian-space so there's no sideways drag before release."""
+    """Move above place_plan's target, descend, open the gripper and retreat
+    (reachy_grasp.execute_place, all cartesian so nothing is dragged sideways)."""
     return reachy_grasp.execute_place(reachy, place_plan)
 
 
 def _retract_after_place(reachy) -> None:
-    """Runs once, right after a placement: head back to default posture and
-    head-camera feed stopped, both arms retracted to the pre-grasping posture
-    (elbow pitch -135 deg) -- a safe, neutral state to sit in while asking
-    whether to pick another object."""
+    """After a placement: head back to its default posture, head-camera feed
+    stopped, both arms retracted to the pre-grasp pose -- a neutral state to
+    sit in while asking whether to pick another object."""
     if reachy.head is not None:
         reachy.head.goto_posture(duration=1.0, wait=False)
         stop_camera_viewer()
@@ -551,11 +316,10 @@ def _retract_after_place(reachy) -> None:
 
 
 def _finish_session(reachy, mobile_base) -> None:
-    """Runs once, when the user declines to pick another object: backs the
-    base up and rotates it 180 deg through the same shared gate an
-    ESC-triggered shutdown uses (so it can't double-fire), then returns to
-    the default posture. main()'s finally block powers everything off
-    afterward."""
+    """End of a session (user declined another object): back the base up and
+    rotate it 180 deg through rotate_base_once's shared gate (so an ESC
+    shutdown cannot rotate it twice), then default posture. main()'s finally
+    block powers everything off afterwards."""
     print(f"\nRotating the base {safety.SHUTDOWN_ROTATION_DEG:.0f} deg...")
     safety.rotate_base_once(mobile_base, reverse_cm=REVERSE_BASE_CM)
 
@@ -564,11 +328,9 @@ def _finish_session(reachy, mobile_base) -> None:
 
 
 def _abort_and_shutdown(reachy, mobile_base, reason: str) -> None:
-    """Called when execute_grasp/execute_place fails to run to completion
-    (unreachable pose or a RuntimeError mid-motion): reports it, backs the
-    base up and rotates it 180 deg (safety.rotate_base_once, same shared gate
-    an ESC-triggered shutdown uses), then powers the robot off smoothly right
-    away instead of pretending the run can continue."""
+    """A grasp/place failed to complete (unreachable pose or a RuntimeError
+    mid-motion): report it, back the base up and rotate it, then power the
+    robot off right away instead of pretending the run can continue."""
     print(f"[ERROR] {reason} -- plan aborted")
     if _metrics is not None:
         _metrics.end_test("aborted: " + reason)
@@ -579,8 +341,12 @@ def _abort_and_shutdown(reachy, mobile_base, reason: str) -> None:
 # --- BoMI control/navigation, with a dwell-in-center switch into grasp mode ---
 def teleop_with_grasp_switch(cap, landmarker, bomi_map, mobile_base, depth_cam, model, confidence, reachy, robot_ip,
                                cursor_filter=None, crs_x=None, crs_y=None) -> None:
-    # Pass in the cursor_filter/crs_x/crs_y from the preceding cursor preview
-    # to continue them, avoiding a velocity blip on entry.
+    """Control loop: cursor -> 9-region velocities -> mobile base. Holding the
+    cursor in region 5 for SELECTION_HOLD_SECONDS opens a Yes/No dialog: the
+    first Yes moves the arms to the pre-grasp pose and resumes Control at
+    reduced speed, the second one opens object selection; No goes back to
+    driving through a cursor preview. Pass the preview's cursor_filter/crs_x/
+    crs_y to continue the cursor without a velocity blip on entry."""
     dt = 1.0 / bomi_teleop.PUBLISH_HZ
     last_publish = time.time()
     cursor_filter = cursor_filter or bomi_teleop.CursorFilter()
@@ -604,10 +370,8 @@ def teleop_with_grasp_switch(cap, landmarker, bomi_map, mobile_base, depth_cam, 
         _metrics.start_test()   # Reachy starts moving after the cursor preview: test starts here
 
     while True:
-        # A quit watcher fires on its own thread and starts the shutdown --
-        # including rotate_base_once's blocking translate/rotate -- while
-        # this loop is still running. Bail out before publishing anything
-        # else, or those speed commands fight the rotation.
+        # A quit watcher may already be shutting down (and rotating the base) on
+        # another thread: stop publishing speed commands or they fight the rotation
         if safety.shutdown_started():
             return
 
@@ -619,7 +383,6 @@ def teleop_with_grasp_switch(cap, landmarker, bomi_map, mobile_base, depth_cam, 
 
         if hand_detected:
             region = bomi_teleop.check_region_cursor(crs_x, crs_y)
-            # speed_scale narrows the range (smaller max)
             lin_vel, ang_vel = bomi_teleop.compute_dynamic_vel_from_cursor(
                 crs_x, crs_y,
                 max_linear=bomi_teleop.MAX_LINEAR * speed_scale,
@@ -638,7 +401,7 @@ def teleop_with_grasp_switch(cap, landmarker, bomi_map, mobile_base, depth_cam, 
             _metrics.region_tick(region, now)
 
         cv2.imshow(map_window, bomi_teleop.draw_cursor_map(crs_x, crs_y, region, message))
-        cv2.moveWindow(map_window, *bomi_teleop.MAP_WINDOW_POS)  # a just-closed window can make the WM reclaim the position otherwise
+        cv2.moveWindow(map_window, *bomi_teleop.MAP_WINDOW_POS)  # re-pin, the WM can move it
         cv2.setWindowProperty(map_window, cv2.WND_PROP_TOPMOST, 1)  # re-pin (same-process windows only)
         safety.raise_window(map_window)  # actually wins over the cross-process fullscreen camera_viewer window
 
@@ -654,7 +417,7 @@ def teleop_with_grasp_switch(cap, landmarker, bomi_map, mobile_base, depth_cam, 
                 break
             center_hold_start = None
             if not decision:
-                # Back to the previous navigation mode - through a cursor preview first
+                # No: back to driving, through a cursor preview
                 cursor_filter.reset(crs_x, crs_y)
                 crs_x, crs_y = bomi_teleop.cursor_preview_phase(
                     cap, landmarker, bomi_map, cursor_filter=cursor_filter, crs_x=crs_x, crs_y=crs_y, show_cam=False,
@@ -663,8 +426,7 @@ def teleop_with_grasp_switch(cap, landmarker, bomi_map, mobile_base, depth_cam, 
                 center_hold_start = None
                 continue
 
-            # First dwell: stop and hold here while the arms move to pre-grasping pose,
-            # then resume Control at limited speed
+            # First dwell: hold the base while the arms move to the pre-grasp pose
             mobile_base.set_goal_speed(vx=0, vy=0, vtheta=0)
             mobile_base.send_speed_command()
             mobile_base.lidar.safety_critical_distance = bomi_teleop.LIDAR_CRITICAL_DISTANCE_SLOWDOWN
@@ -704,7 +466,7 @@ def teleop_with_grasp_switch(cap, landmarker, bomi_map, mobile_base, depth_cam, 
                 break
             center_hold_start = None
             if not decision:
-                # Back to the previous navigation mode - through a cursor preview first
+                # No: back to driving, through a cursor preview
                 cursor_filter.reset(crs_x, crs_y)
                 crs_x, crs_y = bomi_teleop.cursor_preview_phase(
                     cap, landmarker, bomi_map, cursor_filter=cursor_filter, crs_x=crs_x, crs_y=crs_y, show_cam=False,
@@ -713,8 +475,7 @@ def teleop_with_grasp_switch(cap, landmarker, bomi_map, mobile_base, depth_cam, 
                 center_hold_start = None
                 continue
 
-            # Second dwell: switch to object selection mode. The base is held at
-            # zero speed but stays powered on (needed for repositioning).
+            # Second dwell: object selection (base held at zero speed, still on for repositioning)
             mobile_base.set_goal_speed(vx=0, vy=0, vtheta=0)
             mobile_base.send_speed_command()
             print("\nMobile base held at zero speed. Switching to object selection.")
@@ -728,7 +489,7 @@ def teleop_with_grasp_switch(cap, landmarker, bomi_map, mobile_base, depth_cam, 
 
         if now - last_publish >= dt:
             message = f"lin_vel:{lin_vel:.3f} ang_vel:{ang_vel:.3f}"
-            # vtheta is in degrees/s for reachy2_sdk, ang_vel is computed in rad/s
+            # vtheta is in deg/s for reachy2_sdk
             mobile_base.set_goal_speed(vx=lin_vel, vy=0, vtheta=math.degrees(ang_vel))
             mobile_base.send_speed_command()
             last_publish = now
@@ -739,9 +500,8 @@ def teleop_with_grasp_switch(cap, landmarker, bomi_map, mobile_base, depth_cam, 
         if safety.quit_requested(key, map_window):
             break
 
-    # Skipped during a shutdown: safe_robot_shutdown already zeroed the
-    # speed, and turning the base off here would cut rotate_base_once's
-    # rotation short on the watcher's thread.
+    # During a shutdown the watcher thread already zeroed the speed; turning the
+    # base off here would cut its rotation short
     if not safety.shutdown_started():
         mobile_base.set_goal_speed(vx=0, vy=0, vtheta=0)
         mobile_base.send_speed_command()
@@ -753,9 +513,10 @@ def teleop_with_grasp_switch(cap, landmarker, bomi_map, mobile_base, depth_cam, 
 # --- Repositioning: 9-region nav at minimum speed, torso camera, entered from object selection ---
 def repositioning_navigation(cap, landmarker, bomi_map, cursor_filter, crs_x, crs_y, mobile_base, robot_ip) -> tuple:
     """Same 9-region cursor UI as Control, with velocities pinned to
-    MIN_LINEAR/MIN_ANGULAR and torso/depth camera streaming. 
-    Returns (crs_x, crs_y, quit_now) once the cursor has been
-    held centered (region 5) for SELECTION_HOLD_SECONDS."""
+    MIN_LINEAR/MIN_ANGULAR and the torso/depth camera streaming, so the user
+    can adjust the base in front of the objects. Starts with a cursor preview;
+    returns (crs_x, crs_y, quit_now) once the cursor has been held centred
+    for SELECTION_HOLD_SECONDS (back to object selection with a fresh capture)."""
     dt = 1.0 / bomi_teleop.PUBLISH_HZ
     last_publish = time.time()
     map_window = bomi_teleop.MAP_WINDOW_NAME
@@ -765,15 +526,13 @@ def repositioning_navigation(cap, landmarker, bomi_map, cursor_filter, crs_x, cr
 
     print("\n=== REPOSITIONING ===  Q = quit  |  hold the cursor centered (region 5) "
           f"for {SELECTION_HOLD_SECONDS:.0f}s to return to object selection")
-    # Let the torso stream (and the map, re-pinned every frame below) cover the
-    # object-selection window instead of fighting it for the top spot
+    # Torso stream and map over the object-selection window
     cv2.setWindowProperty(reachy_detection.CAM_WINDOW_NAME, cv2.WND_PROP_TOPMOST, 0)
     bring_window_to_front(map_window, bomi_teleop.MAP_WINDOW_POS)  # re-positions it, since it was destroyed on the last exit
     start_camera_viewer(robot_ip, camera="torso")
 
     try:
-        # Preview first (robot not moving) so velocities only start once the
-        # cursor is confirmed centered, same as Control on entry/resume.
+        # Cursor preview first, as in Control
         crs_x, crs_y = bomi_teleop.cursor_preview_phase(
             cap, landmarker, bomi_map, cursor_filter=cursor_filter, crs_x=crs_x, crs_y=crs_y, show_cam=False,
             hold_seconds=SELECTION_HOLD_SECONDS,
@@ -781,9 +540,6 @@ def repositioning_navigation(cap, landmarker, bomi_map, cursor_filter, crs_x, cr
         center_hold_start = None
 
         while True:
-            # Same reason as in teleop_with_grasp_switch: a quit watcher can
-            # already be mid-shutdown on another thread, and anything
-            # published here would fight its base rotation.
             if safety.shutdown_started():
                 return crs_x, crs_y, True
 
@@ -809,7 +565,7 @@ def repositioning_navigation(cap, landmarker, bomi_map, cursor_filter, crs_x, cr
                 _metrics.region_tick(region, now)
 
             cv2.imshow(map_window, bomi_teleop.draw_cursor_map(crs_x, crs_y, region, message))
-            cv2.moveWindow(map_window, *bomi_teleop.MAP_WINDOW_POS)  # a just-closed window can make the WM reclaim the position otherwise
+            cv2.moveWindow(map_window, *bomi_teleop.MAP_WINDOW_POS)  # re-pin, the WM can move it
             cv2.setWindowProperty(map_window, cv2.WND_PROP_TOPMOST, 1)  # re-pin (same-process windows only)
             safety.raise_window(map_window)  # actually wins over the cross-process fullscreen camera_viewer window
 
@@ -862,8 +618,7 @@ def main() -> None:
     cli_args = parser.parse_args()
 
     global _metrics
-    # The optimal path length for normalized_path_length is
-    # session_metrics.DEFAULT_OPTIMAL_PATH_LENGTH: set it there before the session.
+    # optimal path length for normalized_path_length: session_metrics.DEFAULT_OPTIMAL_PATH_LENGTH
     _metrics = session_metrics.SessionMetrics(cli_args.subject, dwell_seconds=SELECTION_HOLD_SECONDS)
 
     if not os.path.exists(cli_args.model):
@@ -915,10 +670,6 @@ def main() -> None:
 
     def _on_emergency_quit() -> None:
         stop_camera_viewer()
-        # Back up + rotate before powering off from the moment object
-        # selection first opened, whatever the robot happens to be doing when
-        # ESC/Q lands -- object selection, a confirm dialog, mid-grasp. Before
-        # that it's only driving around, with nothing to back away from.
         safety.emergency_shutdown(reachy, mobile_base, rotate_base_before_shutdown=_grasp_phase_entered)
 
     safety.start_global_quit_watcher(_on_emergency_quit)
@@ -970,8 +721,8 @@ def main() -> None:
         stop_camera_viewer()
         if stop_terminal_watcher is not None:
             stop_terminal_watcher()
-        # Session metrics: a run that ends any way other than "no more objects"
-        # is closed here as a quit, then written out whatever happened.
+        # Session metrics: a run that did not end with "no more objects" is
+        # closed here as a quit; the file is written whatever happened
         _metrics.end_test("quit")
         summary = _metrics.save()
         print(f"[metrics] test {summary['test_duration'] or 0:.0f}s, navigation {summary['navigation_duration'] or 0:.0f}s, "

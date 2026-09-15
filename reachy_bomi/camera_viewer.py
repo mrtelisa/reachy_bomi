@@ -1,19 +1,15 @@
 #!/usr/bin/env python3
-"""Connect to Reachy2 and show a live feed from its head/teleop camera's
-LEFT eye. Meant to run as its own OS process, spawned during Control so the 
-camera's network round-trip never sits inside the main file cursor/velocity-timed loop.
-
-Usage:
-    python3 camera_viewer.py [robot_ip]
-    Q, ESC, or closing the window = quit.
+"""
+Live feed from a Reachy2 camera (--camera teleop = head, torso = depth cam),
+run as its own process by reachy_control.py so the network round-trip stays
+out of the control loop. Q/ESC/close = quit.
 """
 
 import argparse
 import os
 import sys
 
-# Force XWayland so cv2's fullscreen/topmost window hints actually work (must be
-# set before cv2 creates a window; set here too in case this runs standalone)
+# XWayland: cv2's fullscreen/topmost hints only work there
 os.environ.setdefault("QT_QPA_PLATFORM", "xcb")
 
 import cv2

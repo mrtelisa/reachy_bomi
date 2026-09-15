@@ -1,36 +1,17 @@
 """
-Session metrics for the Reachy teleop + grasp experiment (reachy_control.py).
+Session metrics of a reachy_control.py run, written to
+results_robot/<subject>_session.json (_1, _2, ... for later sessions).
+Test = from Control start (after the cursor preview) to the "No" to "pick
+another object?". Positions come from the mobile base odometry.
 
-One SessionMetrics object per run collects, from the moment Control starts
-after the cursor preview ("test start") to the moment the user declines to
-pick another object ("test end"):
-
-  test_duration              test start -> test end
-  navigation_duration        test start -> first time object selection opens
-  n_repositioning            how many times repositioning navigation was used
-  objects_moved              names of the objects picked AND placed (count + list)
-  path_length_max_speed      base path [m] while driving at full speed (before the pre-grasp pose)
-  path_length_reduced_speed  base path [m] while driving at reduced speed (after the pre-grasp pose)
-  path_length_repositioning  base path [m] during repositioning navigation
-  path_length_total          sum of the three
-  path_length_navigation     max + reduced speed, i.e. the path up to the first object selection
-  optimal_path_length        DEFAULT_OPTIMAL_PATH_LENGTH (metres), set below before the session
-  normalized_path_length     path_length_navigation / optimal_path_length
-  log_dimensionless_jerk     smoothness of the navigation trajectory (test start -> first
-                             object selection): -ln( sqrt(0.5 * int |jerk|^2 dt * T^5 / L^2) ),
-                             Hogan & Sternad 2009, L = straight-line displacement start -> end
-  region_time_percent        share of the driving time the cursor spent in each of the 9
-                             regions (cursor previews and confirm dialogs excluded); the
-                             dwell time of every completed dwell (dwell_seconds * n_dwell) is
-                             removed from region 5 first
-  n_dwell                    dwells completed while driving (Control + repositioning)
-  n_dwell_declined           of those, "Do you want to continue on the pipeline?" answered No,
-                             i.e. dwell + switch without a change of state
-
-Positions come from the mobile base odometry (mobile_base.get_current_odometry),
-sampled by the control loops through sample(). Everything is written to
-results_robot/<subject>_session.json (a subject with previous sessions gets
-_1, _2, ... appended).
+  test_duration, navigation_duration   navigation = up to the first object selection
+  n_repositioning                      repositioning navigations used
+  objects_moved                        objects picked and placed
+  path_length_max_speed / _reduced_speed / _repositioning / _navigation / _total  [m]
+  optimal_path_length, normalized_path_length   navigation path / DEFAULT_OPTIMAL_PATH_LENGTH
+  log_dimensionless_jerk               navigation smoothness (Hogan & Sternad 2009)
+  region_time_percent                  driving time per region, dwells removed from region 5
+  n_dwell, n_dwell_declined            dwells while driving, and those answered "No"
 """
 
 import datetime
@@ -44,9 +25,7 @@ import numpy as np
 
 RESULTS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "results_robot")
 
-# Length [m] of the optimal navigation path from the start pose to the
-# objects, used for normalized_path_length. Set it here before a session
-# (it depends on how the room is laid out); None = not known, no normalization.
+# Optimal navigation path [m] for normalized_path_length: set before a session (None = skip)
 DEFAULT_OPTIMAL_PATH_LENGTH = None
 
 MODE_MAX = "max_speed"
@@ -56,8 +35,7 @@ MODES = (MODE_MAX, MODE_REDUCED, MODE_REPOSITIONING)
 
 JERK_RESAMPLE_HZ = 20.0   # odometry is sampled at the control loop rate (PUBLISH_HZ)
 REGIONS = tuple(range(1, 10))
-# A gap between two region ticks longer than this means the control loop was
-# not running (cursor preview, confirm dialog, arms moving...): not counted.
+# Longer gaps between region ticks = control loop not running (preview, dialog): not counted
 REGION_TICK_MAX_GAP_S = 0.5
 
 
@@ -184,11 +162,6 @@ class SessionMetrics:
             if 0.0 < gap <= REGION_TICK_MAX_GAP_S and region in self.region_time:
                 self.region_time[region] += gap
         self._last_region_tick = now
-
-    def reset_path_origin(self) -> None:
-        """Call after a base motion that is not the user's driving (e.g. the
-        automatic back-up/rotation), so the jump is not counted as path."""
-        self._last_xy = None
 
     # --- results ---
     @property

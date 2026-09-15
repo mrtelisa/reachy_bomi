@@ -1,15 +1,8 @@
 #!/usr/bin/env python3
 """
-Standalone BoMI calibration loader -- no robot connection needed.
+Load a saved calibration and try it live on the cursor map, no robot needed. Q = quit.
 
-Loads a calibration previously saved with calibrate_bomi.py and lets you
-try/use it live on the cursor map. Q = quit.
-
-Usage:
     python3 load_bomi.py NAME [--cam INDEX] [--model PATH]
-
-    NAME is the calibration to load, e.g. "elisa" for
-    calibrations/elisa.npz (the .npz extension is optional).
 """
 
 import argparse

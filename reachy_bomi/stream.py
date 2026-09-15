@@ -1,6 +1,5 @@
 #!/usr/bin/env python3
-"""Library module -- Camera-streaming primitives parameterized (
-window name, camera view, quit check)."""
+"""Blocking live feed of a Reachy camera view (used by camera_viewer.py)."""
 
 from typing import Callable
 
@@ -8,22 +7,11 @@ import cv2
 from reachy2_sdk.media.camera import CameraView, DepthCamera
 
 
-def show_frame(depth_cam: DepthCamera, window_name: str, view: CameraView = CameraView.LEFT) -> None:
-    """One non-blocking grab+show of a Reachy camera view. Meant to be
-    called once per iteration of an already-running cv2 loop -- not run in its own loop."""
-    result = depth_cam.get_frame(view=view)
-    if result is not None:
-        frame, _timestamp = result
-        cv2.imshow(window_name, frame)
-
-
 def stream_blocking(
     depth_cam: DepthCamera, window_name: str, quit_requested: Callable[[int, str], bool],
     view: CameraView = CameraView.LEFT,
 ) -> None:
-    """Live feed in its own loop, no detection, until quit_requested(key,
-    window_name) is True (e.g. Q/ESC pressed, or the window closed).
-    quit_requested is injected."""
+    """Show frames until quit_requested(key, window_name) is True."""
     print("\n=== LIVE RGB STREAM (no detection) ===  Q = quit")
     while True:
         result = depth_cam.get_frame(view=view)

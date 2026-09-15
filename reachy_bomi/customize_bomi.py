@@ -1,29 +1,12 @@
 #!/usr/bin/env python3
 """
-Standalone BoMI customization tool -- no robot connection needed.
+Customization tool, no robot needed: load a saved calibration, adjust it live
+and save it under a new name (the original is untouched).
 
-Loads a calibration previously saved with calibrate_bomi.py, lets you rotate,
-flip and rescale the cursor map live (exactly like Naji's "Customization" step:
-rotation_custom/scale_custom/offset_custom composed on top of the base AE map),
-and saves the result as a brand new calibration -- the original file is never
-modified, so you can always go back to it.
+Keys: [ / ] rotate, i / o flip X / Y, - / = scale, h j k l offset, r reset,
+      s save as..., q quit
 
-Keys:
-    [ / ]   rotate -5 / +5 degrees
-    i / o   flip X axis / flip Y axis
-    - / =   scale down / up (both axes)
-    h / l   nudge offset left / right
-    k / j   nudge offset up / down
-    r       reset (discard all changes, reload the original map)
-    s       save as... (prompts for a new calibration name)
-    q       quit without saving
-
-Usage:
     python3 customize_bomi.py NAME [--cam INDEX] [--model PATH]
-
-    NAME is the calibration to load, e.g. "elisa" for calibrations/elisa.npz
-    (the .npz extension is optional). The customized map is saved under a
-    different name you choose when pressing 's'.
 """
 
 import argparse

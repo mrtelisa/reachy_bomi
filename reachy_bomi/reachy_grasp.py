@@ -1,12 +1,8 @@
 #!/usr/bin/env python3
 """
-Library module-- Grasp planning + execution: from reachy_detection.py's point
-cloud (position, axes, width/height, table normal) for a confirmed object,
-computes pre-grasp/grasp/lift end-effector poses and drives the arm through
-them.
-
-World pose matrix convention: X forward, Y left, Z up; verified at
-https://docs.pollen-robotics.com/developing-with-reachy-2/basics/4-use-arm-kinematics/.
+Grasp planning + execution: from an ObjectGeometry (position, axes, size,
+table normal) computes pre-grasp/grasp/lift poses, the place poses, and drives
+the arm through them. World frame: X forward, Y left, Z up.
 """
 
 from typing import List, NamedTuple, Optional
@@ -27,24 +23,16 @@ GRASP_LIFT_M = 0.15
 
 ARM_GOTO_DURATION_S = 3.0 
 
-# How far outside the object's near surface (beyond its radius) the
-# commanded EE position sits, per arm -- the left arm has been observed to
-# fall consistently a bit short of the commanded pose, dropping the object,
-# so it gets a negative margin (reaches past the surface) to compensate
+# Approach margin outside the object's surface, per arm (the left arm falls
+# short of the commanded pose: negative margin to compensate)
 GRASP_APPROACH_MARGIN_DX_M = 0.0  # r_arm
 GRASP_APPROACH_MARGIN_SX_M = -0.02  # l_arm TODO: find right value
 _GRASP_APPROACH_MARGIN_BY_ARM = {"r_arm": GRASP_APPROACH_MARGIN_DX_M, "l_arm": GRASP_APPROACH_MARGIN_SX_M}
 
-# How much higher than the original grasp height plan_place releases the
-# object, per arm: releasing at exactly that height lands a bit off (object
-# slip in the gripper during transit, arm sag under its weight), and by a
-# different amount per arm -- the left one observed to let go higher than
-# the right, the same arm that already needs GRASP_APPROACH_MARGIN_SX_M, so
-# probably the same underlying sag. Positive raises the release point.
+# Release height margin above the original grasp height, per arm (object slip /
+# arm sag differ per arm; positive = release higher)
 PLACE_HEIGHT_MARGIN_DX_M = 0.007  # r_arm, observed to place correctly
-# l_arm TODO: find right value. It releases higher than r_arm, so it wants
-# less margin, not more -- tune downward (negative is allowed) rather than
-# up, since overshooting the other way presses the object into the table.
+# l_arm releases higher than r_arm: tune downward if needed
 PLACE_HEIGHT_MARGIN_SX_M = -0.003
 _PLACE_HEIGHT_MARGIN_BY_ARM = {"r_arm": PLACE_HEIGHT_MARGIN_DX_M, "l_arm": PLACE_HEIGHT_MARGIN_SX_M}
 
@@ -62,13 +50,9 @@ GRASP_HEIGHT_FRACTION = 3 / 5
 # How many horizontal approach directions is_roughly_reachable tries
 QUICK_REACHABILITY_CANDIDATE_COUNT = 8
 
-# Horizontal distance from the robot's base axis past which no arm can
-# reach, used by plan_place to reject a target outright instead of running
-# an IK search that would certainly fail. Deliberately generous, well past
-# what the arm can actually do: too large only wastes a little time on
-# hopeless poses, while too small would wrongly refuse a reachable one.
-# Measured in the XY plane rather than in 3D, so however high the base frame
-# sits above the floor doesn't enter into it.
+# XY distance from the base axis past which plan_place rejects a target before
+# any IK. Deliberately generous: too large only wastes time on hopeless poses,
+# too small would refuse reachable ones.
 MAX_REACH_XY_M = 1.0
 
 
@@ -254,15 +238,10 @@ def _plan_grasp_for_arm(
 def plan_grasps_by_arm(
     reachy: ReachySDK, geometry: ObjectGeometry, count: int = APPROACH_CANDIDATE_COUNT,
 ) -> dict:
-    """{arm_name: GraspPlan} for every arm that can actually pick `geometry`
-    up -- empty if neither can (or its pose couldn't be estimated / it's too
-    wide for the gripper). Near-side arm first.
-
-    The placement grid needs all of them, not a single winner: which arm
-    ends up doing the job depends on where the user chooses to put the
-    object down, which isn't known yet at grasp-planning time. An object
-    only one arm can pick up filters the grid to that arm's reach; one both
-    can pick up shows the union, and the chosen cell decides the arm."""
+    """{arm_name: GraspPlan} for every arm that can pick `geometry` up (near-side
+    arm first); empty if neither can, or it is too wide / its pose unknown.
+    All of them are needed because the placement cell the user picks later is
+    what decides which arm does the job."""
     targets = _grasp_targets(geometry)
     if targets is None:
         return {}
@@ -285,14 +264,9 @@ def plan_grasps_by_arm(
 def plan_grasp(
     reachy: ReachySDK, geometry: ObjectGeometry, arm_name: Optional[str] = None,
 ) -> Optional[GraspPlan]:
-    """Pre-grasp + grasp + lift end-effector poses for `geometry`, or None if
-    its pose couldn't be estimated, it's too wide for the gripper, or no
-    approach direction is reachable.
-
-    Approaches horizontally at GRASP_HEIGHT_FRACTION of the object's height.
-    arm_name pins which arm to plan for -- which is what the placement grid
-    decides, see plan_grasps_by_arm; without it the near-side arm is tried
-    first, then the far-side one."""
+    """Pre-grasp + grasp + lift poses for `geometry` (horizontal approach at
+    GRASP_HEIGHT_FRACTION of its height), or None if unreachable / too wide.
+    arm_name pins the arm; otherwise near-side first, then far-side."""
     targets = _grasp_targets(geometry)
     if targets is None:
         return None
@@ -316,46 +290,15 @@ def plan_place(
     table_normal: Optional[npt.NDArray[np.float64]], target_point: npt.NDArray[np.float64],
     candidate_count: int = APPROACH_CANDIDATE_COUNT,
 ) -> Optional[GraspPlan]:
-    """Place GraspPlan for the object plan already grasped: released at the
-    same height it was grasped from (plan.grasp_matrix's height along
-    table_normal), directly above target_point's horizontal position --
-    mirroring the lift exactly (climb X, carry across, descend the same X)
-    instead of computing an absolute release height from the target surface
-    + object height, which repeatedly proved fragile in practice (wrong
-    direction, IK solver flakiness) and is redundant anyway: moving
-    perpendicular to table_normal is by definition horizontal, so wherever
-    target_point sits along table_normal doesn't matter for a level table.
-
-    Searches orientations the way plan_grasp does, rather than inheriting
-    the grasp's: the orientation the object is currently held in is tried
-    first (so a wrist that doesn't need to move doesn't move), then
-    `candidate_count` horizontal approaches around the circle. Every
-    candidate keeps the gripper's local X up (_side_grasp_closing_axis), so
-    switching between them only yaws the held object about its own vertical
-    axis, never tips it -- and the retreat follows whichever orientation
-    won, so it always withdraws along the gripper's own axis, clear of the
-    object's sides.
-
-    Returns three waypoints, reusing GraspPlan's fields:
-      - lift_matrix: "transit" -- above target_point's horizontal position,
-        at plan.lift_matrix's height, so the carry ends at the same height
-        the lift ended at.
-      - grasp_matrix: "place" -- same horizontal position, dropped back down
-        by the same distance plan.lift_matrix climbed above plan.grasp_matrix
-        (where the gripper opens), plus this arm's own
-        _PLACE_HEIGHT_MARGIN_BY_ARM -- releasing at exactly the original
-        grasp height lands a bit off, by a different amount per arm.
-      - pregrasp_matrix: "retreat" -- PREGRASP_STANDOFF_M back out from
-        there once the gripper has opened, along the winning orientation's
-        own forward axis rather than up along table_normal or any direction
-        picked independently of orientation: that's the only direction
-        guaranteed clear of the object's sides for the still-open fingers to
-        withdraw along without dragging/knocking it.
-
-    Returns None (silently -- _build_place_grid calls this once per grid
-    cell) if target_point is past MAX_REACH_XY_M, or if no orientation puts
-    all three poses within reach of plan.arm_name, so the caller can ask the
-    user for a different point."""
+    """Place poses for an object already grasped with `plan`, above target_point:
+    transit at the lift height, place dropped by the same distance the lift
+    climbed (plus the arm's height margin), retreat PREGRASP_STANDOFF_M along
+    the gripper's own axis -- the only direction guaranteed clear of the
+    object's sides. Orientation: the one the object is held in first, then
+    candidate_count horizontal approaches, all keeping the gripper's X up so
+    the object is yawed but never tipped. Returns a GraspPlan reusing
+    (lift_matrix, grasp_matrix, pregrasp_matrix) for transit/place/retreat,
+    or None (silently: called once per grid cell) if out of reach."""
     arm = getattr(reachy, plan.arm_name, None)
     if arm is None:
         return None
@@ -370,17 +313,11 @@ def plan_place(
     transit_position = target_inplane + normal * lift_height
     place_position = target_inplane + normal * grasp_height
 
-    # Geometric reject before any IK. _build_place_grid calls this once per
-    # cell, and a cell nothing can serve otherwise burns the whole
-    # candidate_count x 3 search, per arm -- roughly 16x what a cell that
-    # succeeds on its first candidate costs. Most of those are background
-    # (wall, floor) metres out, which this rules out for free.
+    # Cheap geometric reject before the IK search (called once per grid cell)
     if np.linalg.norm(place_position[:2]) > MAX_REACH_XY_M:
         return None
 
-    # -grasp_matrix's local z is the approach it was built from
-    # (_orientation_from_approach), so this re-derives the current orientation
-    # as candidate #0 rather than special-casing it.
+    # Current orientation (approach = -grasp_matrix's local z) as candidate #0
     held_approach = -plan.grasp_matrix[:3, 2]
     for approach in [held_approach] + _approach_candidates(place_position, normal, count=candidate_count):
         rotation = _orientation_from_approach(approach, _side_grasp_closing_axis(approach, normal))
@@ -487,30 +424,11 @@ def place_back(reachy: ReachySDK, plan: GraspPlan, duration: float = ARM_GOTO_DU
 
 
 def execute_place(reachy: ReachySDK, place_plan: GraspPlan, duration: float = ARM_GOTO_DURATION_S) -> bool:
-    """Drives place_plan.arm_name -- already holding the object after
-    execute_grasp -- from wherever it currently is (the lift pose, near the
-    original pickup spot) through: over to the target's XY at the same
-    height it was lifted to (place_plan.lift_matrix, plan_place's "transit"
-    waypoint), straight down to the target, dropping by the same distance
-    the lift climbed (place_plan.grasp_matrix), open the gripper, straight
-    back out PREGRASP_STANDOFF_M along the gripper's own forward axis
-    (place_plan.pregrasp_matrix -- withdrawing along the same line it
-    approached on, clear of the object's sides, not lifting away over it or
-    pulling off at some other angle that could drag/knock it).
-
-    The transit leg interpolates in joint space, so the wrist is free to
-    rotate on the way (plan_place may pick a different orientation than the
-    object is currently held in) as long as it arrives at the chosen pose --
-    a straight cartesian line there can't always accommodate both the
-    translation and the reorientation. The two legs near the object, where
-    the path itself matters, stay cartesian: a clean vertical drop and a
-    clean straight withdrawal. The head tracks the end-effector throughout.
-
-    Returns False without moving if the arm/gripper isn't available or any
-    pose is unreachable from the arm's current joints; returns False
-    (partway through, object already lowered/released) if a goto raises
-    RuntimeError mid-sequence -- both cases are reported, never left to
-    propagate and crash the caller."""
+    """Carry the held object to place_plan: joint-space transit above the target
+    (the wrist may need to rotate on the way), cartesian descent, gripper
+    open, cartesian retreat along the gripper axis; the head tracks the
+    end-effector. Returns False without moving if a pose is unreachable, or
+    partway through if a goto raises."""
     arm: Optional[Arm] = getattr(reachy, place_plan.arm_name, None)
     if arm is None or arm.gripper is None:
         print(f"[ERROR] {place_plan.arm_name} or its gripper is not available -- place not executed")

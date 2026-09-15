@@ -1,13 +1,8 @@
 #!/usr/bin/env python3
-"""Quit/shutdown safety net for the whole pipeline.
-
-Two layers, because a single cv2.waitKey-based check only ever fires while
-a cv2 window has OS focus and the caller's own loop is actively polling it:
-  - quit_requested: local, in-loop check (Q/ESC while a cv2 window has
-    focus, or that window closed) for graceful "go back a step" UI flow.
-  - start_global_quit_watcher / start_terminal_quit_watcher: OS-level
-    watchers on a background thread, so ESC/Q stops the robot regardless
-    of what the main thread is doing or which window has focus.
+"""
+Quit/shutdown safety net: in-loop quit checks (Q/ESC, window closed) plus
+OS-level ESC/Q watchers on a background thread, and the one-shot base
+back-up + rotation and robot power-off they trigger.
 """
 
 import os
@@ -22,8 +17,7 @@ import tty
 import cv2
 from reachy2_sdk import ReachySDK
 
-# How far the base translates backward, then how much it rotates in place,
-# before powering down, when rotate_base_before_shutdown is set to True
+# Back-up distance and in-place rotation before powering down next to the table
 SHUTDOWN_REVERSE_CM = 20.0
 SHUTDOWN_ROTATION_DEG = 180.0
 
@@ -36,28 +30,18 @@ _shutdown_started = threading.Event()
 
 
 def shutdown_started() -> bool:
-    """True once safe_robot_shutdown has begun, on any thread. The quit
-    watchers call it from their own threads while the teleop loops are still
-    running on the main one, so those loops must stop commanding the base the
-    moment this goes True: rotate_base_once's translate/rotate block for
-    seconds, and speed commands published on top of them fight the rotation
-    (an ESC pressed with the cursor off-center is actively commanding a spin)
-    -- which is how a deliberate 180 deg turn ends up overshooting."""
+    """True once safe_robot_shutdown has begun, on any thread. The quit watchers
+    run on their own threads while the teleop loops are still running: those
+    loops must stop commanding the base as soon as this is True, or their
+    speed commands fight the shutdown rotation and it overshoots."""
     return _shutdown_started.is_set()
 
 
 def rotate_base_once(mobile_base, reverse_cm: float = SHUTDOWN_REVERSE_CM) -> None:
-    """Translate back + rotate SHUTDOWN_ROTATION_DEG, but only the first time
-    this is called in the whole process -- guards against the wind-down
-    rotation and an ESC-triggered shutdown (or two quit watchers) firing at
-    the same time and rotating the base twice.
-
-    The lock is held for the whole movement, not just the flag check, so a
-    second caller *waits here* instead of returning while the rotation is
-    still running. It has to: both callers go on to power the robot off and
-    disconnect, and doing that mid-rotation kills the rotation and drops the
-    arms -- which is what pressing ESC used to do, since ESC reaches both the
-    quit watcher's thread and the dwell loop's own quit check."""
+    """Translate back + rotate SHUTDOWN_ROTATION_DEG, only the first time it is
+    called in the process: the wind-down rotation and an ESC shutdown can fire
+    together. The lock is held for the whole movement, so a concurrent caller
+    waits instead of powering the robot off mid-rotation."""
     global _rotation_done
     with _rotation_lock:
         if _rotation_done or mobile_base is None:
@@ -72,11 +56,8 @@ def rotate_base_once(mobile_base, reverse_cm: float = SHUTDOWN_REVERSE_CM) -> No
 
 
 def force_fullscreen(window_name: str) -> None:
-    """Requests the EWMH fullscreen state via wmctrl. Some Qt/opencv-python
-    builds report cv2's own WND_PROP_FULLSCREEN as set without Mutter ever
-    actually resizing the window -- this bypasses that by asking the WM
-    directly. Call once, after the window is first shown. No-ops (after one
-    warning) if wmctrl isn't installed."""
+    """Ask the window manager (wmctrl) for fullscreen: some Qt builds ignore cv2's
+    WND_PROP_FULLSCREEN. No-op if wmctrl is missing."""
     global _wmctrl_missing_warned
     try:
         subprocess.run(["wmctrl", "-r", window_name, "-b", "add,fullscreen"],
@@ -88,20 +69,14 @@ def force_fullscreen(window_name: str) -> None:
             _wmctrl_missing_warned = True
 
 
-# Throttle for raise_window -- meant to be called every display-loop frame,
-# but should only actually spawn wmctrl a few times a second
+# raise_window throttle (called every frame, wmctrl spawned a few times a second)
 _RAISE_WINDOW_INTERVAL_S = 0.5
 _last_raise_time: dict = {}
 
 
 def raise_window(window_name: str) -> None:
-    """Actively re-activates a window by title via wmctrl -- the same action
-    as alt-tabbing to it. Needed because cv2's own WND_PROP_TOPMOST only
-    beats another window from the *same process*; confirmed it silently
-    loses to a fullscreen window from a different process (e.g.
-    camera_viewer.py's subprocess), which this fixes. Safe to call every
-    frame -- throttled internally. No-ops (after one warning) if wmctrl
-    isn't installed."""
+    """Re-activate a window via wmctrl (cv2's TOPMOST loses to windows of other
+    processes, e.g. camera_viewer.py). Throttled; no-op if wmctrl is missing."""
     global _wmctrl_missing_warned
     now = time.time()
     if now - _last_raise_time.get(window_name, 0.0) < _RAISE_WINDOW_INTERVAL_S:
@@ -117,13 +92,8 @@ def raise_window(window_name: str) -> None:
 
 
 def destroy_window(window_name: str) -> None:
-    """cv2.destroyWindow, tolerant of the window already being gone. On this
-    Qt backend, destroying an already-destroyed (or never-created) window
-    doesn't no-op -- it raises cv2.error ("NULL guiReceiver"), which used to
-    crash callers that destroy the same window from more than one code path
-    (e.g. once right before execute_grasp, then again in a cleanup path after
-    execute_grasp fails). Use this everywhere instead of cv2.destroyWindow
-    directly."""
+    """cv2.destroyWindow tolerant of the window already being gone (on the Qt
+    backend destroying a missing window raises instead of no-op'ing)."""
     try:
         cv2.destroyWindow(window_name)
     except cv2.error:
@@ -202,17 +172,9 @@ def start_terminal_quit_watcher(on_quit):
 
 
 def safe_robot_shutdown(reachy: ReachySDK, mobile_base=None, rotate_base_before_shutdown: bool = False) -> None:
-    """Stop the base, then power down smoothly. Swallows exceptions.
-
-    rotate_base_before_shutdown=True translates the base back SHUTDOWN_REVERSE_CM
-    then rotates it SHUTDOWN_ROTATION_DEG in place first, via rotate_base_once
-    (so it never double-fires against a concurrent wind-down rotation) -- pass
-    this whenever the robot may be sitting close to a table with its arms
-    about to fold in, so they don't fold into it.
-
-    Flips shutdown_started() first thing, before anything moves, so the
-    teleop loops still running on the main thread stop publishing speed
-    commands that would otherwise fight the rotation below."""
+    """Stop the base and power the robot down smoothly (exceptions swallowed).
+    rotate_base_before_shutdown backs the base up and rotates it first, for
+    when the robot sits next to the table. Flags shutdown_started() first."""
     _shutdown_started.set()
 
     if mobile_base is not None:

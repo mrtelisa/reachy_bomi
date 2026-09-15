@@ -1,14 +1,8 @@
 #!/usr/bin/env python3
 """
-Library module -- hover-to-select/confirm UI for a detected object: maps a
-hover point onto reachy_detection.py's YOLO boxes, drives the
-dwell-to-select/repositioning/confirm flow, and draws the corresponding overlays.
-
-select_object_to_grasp_bomi/confirm_grasp_bomi drive that hover point from a
-BoMI cursor (bomi_teleop.py). 
-
-MouseTracker is a standalone alternative hover-point source, for driving the 
-same box_contains/find_hovered_detection geometry from a real mouse instead.
+Hover-to-select / confirm UI driven by the BoMI cursor: object selection on
+the YOLO boxes, the repositioning button, the placement grid on the table
+plane and the Yes/No dialogs.
 """
 
 import math
@@ -43,28 +37,14 @@ REPOSITION_REQUESTED = object()
 # table plane itself (e.g. "put it in the box") ---
 PLACE_HOVER_SECONDS = DWELL_HOLD_SECONDS
 
-# Real-world side length (m) of each grid cell, laid out on the table plane
-# (not the screen) -- two cells look the same physical size to the robot
-# whether they're near or far in the shot, unlike a screen-space grid where a
-# far cell covers far more real table than a near one. Big enough to dwell on
-# despite BoMI cursor tremor (comparable to a small YOLO detection box in
-# screen terms, at a typical distance); small enough that the placement still
-# lands close to where the user pointed. Tune this first if cells feel too
-# coarse or too fiddly on the real robot.
+# Placement grid. Cell side in real metres on the table plane (not on the
+# screen, so near and far cells are the same physical size): big enough to
+# dwell on despite cursor tremor, small enough to land close to where the user
+# pointed. Only every stride-th pixel is classified (setup cost ~ 1/stride^2).
+# Approach directions tried per cell: fewer than plan_place's default, since it
+# runs once per cell -- lower it if "Computing reachable area..." gets slow.
 PLACE_GRID_CELL_SIZE_M = 0.12
-
-# Every PLACE_GRID_SAMPLE_STRIDE_PXth pixel (in each axis) is classified into
-# a table-plane cell, instead of every pixel -- table cells are big enough
-# (PLACE_GRID_CELL_SIZE_M) relative to any reasonable camera resolution that
-# this loses no visible detail, while cutting the one-time setup cost
-# (dominated by reachy_detection.estimate_world_points_for_frame) by
-# stride**2.
 PLACE_GRID_SAMPLE_STRIDE_PX = 10
-
-# How many approach directions plan_place tries per cell while building the
-# grid -- fewer than its default, since it runs once per cell (hundreds of
-# times) rather than once. Lower this first if "Computing reachable area..."
-# starts taking too long; raise it if too much of the table reads as red.
 PLACE_GRID_CANDIDATE_COUNT = reachy_grasp.QUICK_REACHABILITY_CANDIDATE_COUNT
 
 COLOR_UNREACHABLE = (0, 0, 200)   # BGR red, translucent fill over unreachable/unknown table area
@@ -72,11 +52,10 @@ UNREACHABLE_TINT_ALPHA = 0.35
 
 
 class PlaceGrid(NamedTuple):
-    """One computed placement grid: the frozen frame it was built from, which
-    table-plane cell each screen block belongs to, and what each cell is
-    worth. Built once by build_place_grid, then dwelled on as many times as
-    needed by select_place_location_bomi -- so answering "No" to the
-    placement confirm doesn't pay for the IK search all over again."""
+    """A computed placement grid: the frozen frame it was built from, which
+    table-plane cell each screen block belongs to, and each cell's target
+    point / serving arm. Built once by build_place_grid and reused across
+    dwells, so a "No" at the confirm does not repeat the IK search."""
 
     base_frame: np.ndarray            # the frozen RGB frame the dwell draws on
     stride: int                       # screen px per entry of the coarse_* images
@@ -146,12 +125,7 @@ def _draw_bomi_cursor(frame: np.ndarray, x: int, y: int) -> None:
 
 
 def _table_plane_basis(table_normal: np.ndarray) -> tuple:
-    """Orthonormal in-plane basis perpendicular to table_normal: basis_u is
-    Reachy world X ("forward", per reachy_grasp.py's frame convention)
-    projected onto the plane, basis_v completes a right-handed frame with
-    normal. Falls back to world Y as the reference if the table is (bizarrely)
-    near-vertical relative to X. Returns (normal, basis_u, basis_v), all unit
-    vectors."""
+    """(normal, basis_u, basis_v): orthonormal in-plane basis of the table, basis_u ~ world X."""
     normal = table_normal / np.linalg.norm(table_normal)
     reference = np.array([1.0, 0.0, 0.0])
     if abs(np.dot(reference, normal)) > 0.9:
@@ -167,15 +141,9 @@ def _draw_place_grid(
     coarse_row_img: np.ndarray, coarse_col_img: np.ndarray, stride: int,
     hovered_cell: Optional[tuple], hover_progress: float, hovered_reachable: bool,
 ) -> None:
-    """Tints unreachable/unknown table area red (translucent) -- unreachable_mask
-    is full-resolution and precomputed once in _build_place_grid, since it
-    doesn't change during the dwell. Then outlines hovered_cell's actual
-    projected shape, found via cv2.findContours on the coarse table-plane
-    classification image (so it follows the table's real perspective --
-    smaller/more skewed the farther away it is -- instead of being a flat
-    screen rectangle): yellow and filled with dwell progress if reachable,
-    red (no fill) otherwise, so hovering unreachable table area still gives
-    feedback without ever accumulating progress there."""
+    """Tint unreachable/unknown table area red (translucent, from the precomputed
+    mask) and outline the hovered cell following its real projected shape:
+    yellow and filled with the dwell progress if reachable, red otherwise."""
     red = np.full_like(frame, COLOR_UNREACHABLE)
     blended = cv2.addWeighted(red, UNREACHABLE_TINT_ALPHA, frame, 1 - UNREACHABLE_TINT_ALPHA, 0)
     frame[unreachable_mask] = blended[unreachable_mask]
@@ -313,11 +281,8 @@ def select_object_to_grasp_bomi(
 
 
 def _arm_that_can_place_at(reachy, grasp_plans: dict, geometry, target_point: np.ndarray) -> Optional[str]:
-    """Which of grasp_plans' arms could carry the object to target_point and
-    set it down there, or None if neither can. The arm on the target's own
-    side is tried first, so it's the one that wins when both could -- and so
-    most cells settle on the first try, since the grid runs this once per
-    cell."""
+    """Which arm of grasp_plans can place the object at target_point (the arm on the
+    target's side is tried first), or None."""
     preferred = "r_arm" if target_point[1] < 0 else "l_arm"
     for arm_name in sorted(grasp_plans, key=lambda name: name != preferred):
         place_plan = reachy_grasp.plan_place(
@@ -330,45 +295,11 @@ def _arm_that_can_place_at(reachy, grasp_plans: dict, geometry, target_point: np
 
 
 def _build_place_grid(depth_cam, depth_frame, frame_w, frame_h, reachy, grasp_plans, geometry):
-    """Classifies (a stride-sampled subset of) the frame's pixels by which
-    PLACE_GRID_CELL_SIZE_M cell of the table plane they land in -- a grid
-    laid out in real-world meters on the table itself, not on the screen, so
-    it looks like it's actually resting on the table (perspective-correct:
-    smaller/more skewed toward the horizon) instead of a flat rectangular
-    overlay. The table plane's origin is geometry.centroid (near where the
-    object was picked up) if available, else world origin -- either way just
-    a fixed reference for cell indexing, since only the components
-    perpendicular to table_normal (basis_u/basis_v) affect it.
-
-    For each cell that appears in the frame, computes its real-world center
-    and asks reachy_grasp.plan_place whether ANY of grasp_plans' arms can put
-    the object down there, trying the arm on the cell's own side first (so
-    that's the one that wins when both can). A cell is reachable if at least
-    one arm can, which makes the map the union of both arms' reach when the
-    object can be picked up with either, and just that arm's reach when only
-    one can pick it up.
-
-    The plans themselves are only used to color the grid and to record which
-    arm serves each cell; the caller re-derives the actual grasp and place
-    plans fresh right before moving (see select_place_location_bomi), to
-    minimize how many reachy.inverse_kinematics calls happen between
-    validating them and acting on them -- reachy2_sdk's IK solver appears to
-    seed its search from the last computed solution, so the many speculative
-    IK checks this grid needs can otherwise leave it unable to re-solve a
-    pose it validated only moments earlier.
-
-    Returns (stride, coarse_row_img, coarse_col_img, cell_targets, cell_arms,
-    unreachable_mask):
-      - coarse_row_img/coarse_col_img: int32 arrays, shape
-        (ceil(frame_h/stride), ceil(frame_w/stride)) -- each entry is the
-        table-plane cell (row, col) the corresponding stride x stride screen
-        block landed in, or -1 where there was no valid depth.
-      - cell_targets: {(row, col): xyz point} for every cell that appeared.
-      - cell_arms: {(row, col): arm_name or None} -- which arm would place
-        there, None if neither can.
-      - unreachable_mask: full-resolution (frame_h, frame_w) bool array,
-        True wherever the table area is unknown (no depth) or unreachable --
-        precomputed once here since it doesn't change during the dwell."""
+    """Classify the frame's pixels (every stride-th) into PLACE_GRID_CELL_SIZE_M cells
+    laid on the table plane, and IK-check each cell with plan_place for the arms in
+    grasp_plans. Returns (stride, coarse_row_img, coarse_col_img, cell_targets,
+    cell_arms, unreachable_mask). The plans only colour the grid: the caller
+    re-plans right before moving, since the SDK's IK is seeded by its last solution."""
     stride = PLACE_GRID_SAMPLE_STRIDE_PX
     table_normal = geometry.table_normal if geometry.table_normal is not None else reachy_grasp.DEFAULT_TABLE_NORMAL
     _, basis_u, basis_v = _table_plane_basis(table_normal)
@@ -413,21 +344,8 @@ def _build_place_grid(depth_cam, depth_frame, frame_w, frame_h, reachy, grasp_pl
 
 
 def build_place_grid(depth_cam, reachy, grasp_plans, geometry) -> Optional[PlaceGrid]:
-    """Captures one torso RGB+depth frame -- same as select_object_to_grasp_bomi
-    does for its YOLO detections -- and computes the whole placement grid
-    from it (_build_place_grid): the expensive "Computing reachable area..."
-    step, an IK search per cell.
-
-    Kept separate from select_place_location_bomi's dwell loop so one grid
-    can serve several dwells: answering "No" to the placement confirm
-    re-offers the grid already computed instead of paying for it again.
-
-    grasp_plans is {arm_name: GraspPlan} for every arm that can pick the
-    object up (reachy_grasp.plan_grasps_by_arm) -- the grid shows the union
-    of their reach, and the cell the user settles on is what decides which
-    arm does the job.
-
-    Returns None if the frame couldn't be captured or came without depth."""
+    """Capture one torso RGB+depth frame and build the placement grid from it
+    (the "Computing reachable area..." step). None if no frame/depth."""
     capture = reachy_detection.capture_rgb_and_depth(depth_cam)
     if capture is None:
         print("[place] could not capture a frame from the depth camera")
@@ -455,26 +373,11 @@ def build_place_grid(depth_cam, reachy, grasp_plans, geometry) -> Optional[Place
 
 
 def select_place_location_bomi(cap, landmarker, bomi_map, cursor_filter, crs_x, crs_y, grid: PlaceGrid):
-    """Dwell-to-pick-a-cell loop for placing an already-grasped object (e.g.
-    "put it in the box"), against an already-built grid whose cells are laid
-    out on the table plane itself rather than on the screen. Unlike a
-    free-floating anchor, dwelling is just "is the cursor still over the same
-    table cell as last frame" -- cells don't move, so cursor tremor within
-    one never resets the dwell, only actually crossing into a different cell
-    does.
-
-    Unreachable/unknown table area is tinted red and never accumulates dwell
-    progress (hovering it behaves like hovering nothing), which steers the
-    user away from it without a separate error dialog.
-
-    Confirmed by dwelling on the same reachable cell for PLACE_HOVER_SECONDS.
-    Returns that cell's raw 3D target point and the arm that serves it, not
-    the GraspPlan the grid computed -- the caller should re-derive the actual
-    grasp and place plans right before moving, per _build_place_grid's
-    docstring.
-
-    Returns (target point [xyz, m, Reachy world frame], arm_name, crs_x,
-    crs_y), or (None, None, crs_x, crs_y) if the user quit."""
+    """Dwell-to-pick-a-cell loop on an already-built grid laid on the table plane
+    (cells do not move, so cursor tremor within a cell never resets the dwell).
+    Unreachable area never accumulates progress. Confirmed after
+    PLACE_HOVER_SECONDS on the same reachable cell: returns (target point
+    [m, world frame], arm_name, crs_x, crs_y), or (None, None, crs_x, crs_y) on quit."""
     base_frame = grid.base_frame
     stride, cell_targets, cell_arms = grid.stride, grid.cell_targets, grid.cell_arms
     coarse_row_img, coarse_col_img, unreachable_mask = grid.coarse_row_img, grid.coarse_col_img, grid.unreachable_mask
@@ -591,19 +494,3 @@ def confirm_new_object_bomi(cap, landmarker, bomi_map, cursor_filter, crs_x, crs
         cap, landmarker, bomi_map, cursor_filter, crs_x, crs_y,
         lines=["Object placed.", "Do you want to select a new object?"],
     )
-
-
-# --- Used only for tests, when the BoMI cursor is replaced by the mouse --- 
-class MouseTracker:
-    """Tracks the latest mouse position over the given OpenCV window --
-    a standalone alternative to the BoMI cursor for driving the hover
-    geometry above from a real mouse (see tests/*.py)."""
-
-    def __init__(self, window_name: str) -> None:
-        self.x = -1
-        self.y = -1
-        cv2.namedWindow(window_name)
-        cv2.setMouseCallback(window_name, self._on_mouse)
-
-    def _on_mouse(self, event: int, x: int, y: int, flags: int, param: object) -> None:
-        self.x, self.y = x, y

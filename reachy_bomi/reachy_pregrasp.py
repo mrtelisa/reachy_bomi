@@ -1,9 +1,7 @@
 #!/usr/bin/env python3
 """
-Library module -- pre-grasping pose: sends both arms towards the
-pre-grasping posture (non-blocking) and waits for the move to finish,
-showing a progress-bar window while holding the mobile base at zero speed
-and keeping the BoMI cursor alive.
+Pre-grasp pose: send both arms to the pre-grasp posture (non-blocking) and
+wait for it with a progress bar, holding the base still and the cursor alive.
 """
 
 import time
@@ -60,9 +58,7 @@ def wait_for_pre_grasp_pose(cap, landmarker, bomi_map, cursor_filter, crs_x, crs
     start = time.time()
 
     while True:
-        # A quit watcher may already be shutting down on its own thread,
-        # with rotate_base_once's rotation under way -- the zero goal speed
-        # published below would stop that rotation dead.
+        # A shutdown may already be rotating the base on another thread
         if safety.shutdown_started():
             safety.destroy_window(WAIT_WINDOW_NAME)
             return crs_x, crs_y, True

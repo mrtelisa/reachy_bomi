@@ -1,13 +1,8 @@
 #!/usr/bin/env python3
 """
-Standalone BoMI calibration tool -- no robot connection needed.
+Calibration tool, no robot needed: run the calibration phase, preview the
+cursor live, S = save under a name in calibrations/, Q = quit.
 
-Runs the calibration phase, fits the cursor map, then previews it live so
-you can move your hand and see how it responds before deciding whether to
-keep it: S = save (prompts for a name, stored in calibrations/), Q = quit
-without saving.
-
-Usage:
     python3 calibrate_bomi.py [--cam INDEX] [--model PATH]
 """
 

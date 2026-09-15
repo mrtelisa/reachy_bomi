@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
-Library module -- YOLOv8 detection on the torso camera, depth point-cloud 
-pipeline (frame fusion, distortion correction, table-plane/flying-pixel removal, 
-shape-specific dimension/pose fit), over reachy2_sdk (gRPC/IP).
+YOLOv8 detection on the torso camera and the depth point-cloud pipeline
+(frame fusion, distortion correction, table/flying-pixel removal, shape fit)
+that turns a detected object into a reachy_grasp.ObjectGeometry.
 """
 
 import time
@@ -30,10 +30,7 @@ GRASPABLE_CLASSES = {
     "teddy bear", "toothbrush", "vase",
 }
 
-# Rough shape prior from the YOLO class, used by _object_dimensions to pick
-# the circle (cylinder) or sphere fit that corrects for a single view only
-# ever seeing part of a round object. Only "cylinder"/"sphere" are
-# supported.
+# Shape prior per YOLO class ("cylinder"/"sphere"): picks the fit in _object_dimensions
 SHAPE_BY_CLASS = {
     "bottle": "cylinder", "cup": "cylinder", "wine glass": "cylinder", 
     "banana": "cylinder", "apple": "sphere", "orange": "sphere",
@@ -52,18 +49,14 @@ COLOR_GREEN = (0, 255, 0)
 # to reduce noise. Camera and object are assumed static.
 DEPTH_ACCUMULATION_FRAMES = 10
 
-# Radius of the square patch estimate_position_at_pixel/_estimate_object_width
-# search around their target pixel for a valid depth reading, median'd for
-# robustness.
+# Patch radius searched for a valid depth reading around a pixel (median)
 CHEAP_DEPTH_SEARCH_RADIUS_PX = 15
 
 _cached_fx_px: Optional[float] = None # cached LEFT view's horizontal focal length (pixels)
 
 Capture = Tuple[np.ndarray, List[Detection], dict]
 
-# Crop margin around the YOLO box: _remove_table_plane's RANSAC fit has enough
-# real table in the crop to reliably win against the object's own curved
-# surface
+# Crop margin around the YOLO box, so the RANSAC table fit sees enough table
 BBOX_PADDING_PX = 60
 
 FLYING_PIXEL_NEIGHBORS = 16
@@ -182,13 +175,8 @@ def capture_and_detect(
     depth_cam: DepthCamera, model: YOLO, confidence: float,
     is_selectable: Optional[Callable[[Optional[np.ndarray], Optional[float]], bool]] = None,
 ) -> Optional[Capture]:
-    """Grab one RGB + depth frame and run YOLO once, returning the frame,
-    detections, and their labels.
-
-    If is_selectable is given, detections are pre-filtered down to the ones
-    it accepts, called as is_selectable(position, width) with each
-    detection's single-pixel depth position/width estimate. 
-    is_selectable=None skips this entirely."""
+    """One RGB + depth frame and one YOLO pass. is_selectable(position, width), if
+    given, pre-filters the detections. Returns a Capture or None."""
     result = depth_cam.get_frame(view=CameraView.LEFT)
     if result is None:
         print("[ERROR] Could not capture a frame from the camera")
@@ -225,11 +213,8 @@ def capture_and_detect(
 
 
 def capture_rgb_and_depth(depth_cam: DepthCamera) -> Optional[Tuple[np.ndarray, Optional[np.ndarray]]]:
-    """One live RGB (LEFT) + depth (DEPTH) frame grab, for callers that need a
-    live view without running YOLO on it (reachy_selection.select_place_location_bomi's
-    dwell-to-pick-a-point loop). None only if the RGB frame itself couldn't be
-    captured; the depth frame may come back None on its own if that grab
-    failed, since the RGB frame is still showable without it."""
+    """One live RGB + depth frame without YOLO. None if the RGB grab failed (the
+    depth frame alone may be None)."""
     result = depth_cam.get_frame(view=CameraView.LEFT)
     if result is None:
         return None
@@ -288,9 +273,6 @@ def _depth_crop_to_point_cloud(
     z_c = depth_crop[rows, cols].astype(np.float64) / 1000.0
 
     if correct_distortion:
-        # undistortPointsIter over undistortPoints: the Iter
-        # variant takes a real stopping criterion (at the cost of passing
-        # identity R/P explicitly)
         uv_points = np.stack([u, v], axis=1).reshape(-1, 1, 2)
         undistort_criteria = (cv2.TERM_CRITERIA_MAX_ITER + cv2.TERM_CRITERIA_EPS, 100, 1e-6)
         undistorted = cv2.undistortPointsIter(
@@ -312,18 +294,9 @@ def _depth_crop_to_point_cloud(
 def estimate_world_points_for_frame(
     depth_cam: DepthCamera, depth_frame: np.ndarray, stride: int = 1, correct_distortion: bool = False,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Vectorized pixel_to_world over every stride-th pixel of the whole
-    depth_frame that has valid depth -- same backprojection math as
-    _depth_crop_to_point_cloud (duplicated rather than shared, since that
-    one's box-cropping indexing doesn't compose cleanly with a stride), just
-    generalized to the full frame with a stride for speed. Used by
-    reachy_selection.py to build a table-plane placement grid without a
-    per-pixel Python loop; correct_distortion defaults to False since that's
-    only a display aid there, not a value that drives the robot.
-
-    Returns (rows, cols, points): full-frame pixel row/col arrays (each the
-    top-left corner of its stride x stride block) and their corresponding
-    Reachy-world XYZ points, one row per valid sampled pixel."""
+    """Backproject every stride-th pixel with valid depth of the whole frame to
+    Reachy world XYZ (same math as _depth_crop_to_point_cloud, vectorized).
+    Returns (rows, cols, points). Used to build the placement grid."""
     sampled = depth_frame[::stride, ::stride]
     local_rows, local_cols = np.nonzero(sampled > 0)
     if local_rows.size == 0:
@@ -455,13 +428,9 @@ def _fit_sphere_center(point_cloud: np.ndarray) -> Optional[Tuple[np.ndarray, fl
 def _object_dimensions(
     point_cloud: np.ndarray, shape: str,
 ) -> Tuple[float, float, Optional[np.ndarray], Optional[np.ndarray]]:
-    """Object (width_m, height_m, centroid, axes) from PCA on the isolated
-    point cloud. height_m/width_m are replaced by the circle/sphere fit if shape 
-    is "cylinder" or "sphere", and centroid/axes are replaced by the circle/sphere 
-    fit's 3D center if available.
-
-    Extents use the 1st-99th percentile spread, not raw max-min. Returns (0.0, 0.0,
-    None, None) if too few points remain to fit axes."""
+    """(width_m, height_m, centroid, axes) from PCA on the isolated cloud; for
+    "cylinder"/"sphere" the circle/sphere fit replaces width/height and centre.
+    (0.0, 0.0, None, None) if too few points."""
     if point_cloud.shape[0] < 3:
         return 0.0, 0.0, None, None
     centroid = point_cloud.mean(axis=0)
@@ -491,11 +460,10 @@ def _object_dimensions(
 def build_object_point_cloud(
     depth_cam: DepthCamera, class_name: str, box: Box, num_frames: int = DEPTH_ACCUMULATION_FRAMES,
 ) -> Optional[reachy_grasp.ObjectGeometry]:
-    """Crops the object to its bbox and fuse num_frames depth readings, 
-    backproject every valid pixel to 3D, then isolate the object itself 
-    before measuring it. Camera and object are assumed static during this.
-    Returns an ObjectGeometry for reachy_grasp.plan_grasp to consume, or 
-    None if the user quit."""
+    """Crop to the box, fuse num_frames depth readings (camera and object assumed
+    static), backproject every valid pixel, isolate the object (table plane and
+    flying pixels removed) and measure it. Returns an ObjectGeometry for
+    reachy_grasp.plan_grasp, or None if the user quit meanwhile."""
     print(f"\n=== Building point cloud for '{class_name}' "
           f"({num_frames} depth frames) ===  Q = quit")
 
@@ -527,7 +495,7 @@ def build_object_point_cloud(
     print(f"Valid depth pixels: {valid_before:.0f}% (single frame) -> "
           f"{valid_after:.0f}% (after {num_frames}-frame fusion)")
 
-    # Diagnostic plots for the 4 pipeline stages are commented out
+    # Diagnostic plots of the 4 pipeline stages (graphs.py): uncomment to inspect
     raw_cloud = _depth_crop_to_point_cloud(depth_cam, fused_crop, padded_box, correct_distortion=False)
     #graphs.show_point_cloud(raw_cloud, f"{class_name} - 1 acquired")
 

@@ -1,16 +1,9 @@
 #!/usr/bin/env python3
 """
-Library module -- BoMI teleop building blocks for Reachy2: hand tracking
-(MediaPipe) to a calibrated autoencoder cursor to 9-region base velocity, over
-reachy2_sdk (gRPC/IP).
-
-Phase 1 - Calibration (calibration_phase): move your hand through all
-    positions you intend to use. SPACE = record sample, ENTER = finish
-    (min 30 samples required).
-
-Phase 2 - Cursor preview (cursor_preview_phase): same cursor/region view
-    as Control, but nothing is sent to the robot -- lets the caller get a
-    feel for the cursor before it starts driving anything.
+BoMI teleop building blocks for Reachy2: hand tracking (MediaPipe) ->
+autoencoder cursor -> 9-region base velocity, plus the calibration and
+cursor-preview phases. Library module used by reachy_control.py and the
+calibration tools.
 """
 
 import os
@@ -42,7 +35,7 @@ LIDAR_CRITICAL_DISTANCE_SLOWDOWN = 0.15  # [m], when approaching the object
 BASE_WIDTH = 2550
 BASE_HEIGHT = 1500
 
-# MIN_LINEAR/MIN_ANGULAR to let the mobile base's wheels overcome their own resistance 
+# MIN_* let the wheels overcome their own resistance
 MIN_LINEAR = 0.2      # [m/s]
 MAX_LINEAR = 0.5      # [m/s]
 MIN_ANGULAR = 0.8     # [rad/s]
@@ -52,27 +45,21 @@ DEAD_ZONE_PX = 200    # pixel radius around screen center before motion starts
 
 PUBLISH_HZ = 20  # [Hz] speed-command rate — comfortably under the mobile base's 0.2s command duration
 
-# MediaPipe Tasks hand-landmarker model (.task), lives at the package root by default.
 DEFAULT_MODEL_PATH = os.path.join(
     os.path.dirname(os.path.abspath(__file__)), "..", "hand_landmarker.task"
 )
 
-# Shared window names for the cursor preview and control phases, so the same
-# OS windows stay open across the transition instead of closing and reopening.
+# Window names shared by preview and control, so the windows carry over
 CAM_WINDOW_NAME = "BoMI - Camera"
 MAP_WINDOW_NAME = "BoMI - Cursor Map"
 
-# Screen position (top-left corner) the map window is pinned to
 MAP_WINDOW_POS = (0, 0)
 
-# Saved BoMIMap calibrations (see BoMIMap.save_map_bomi/load_map_bomi) live in
-# a 'calibrations/' folder next to the package.
 CALIB_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "calibrations")
 
 
 def resolve_calib_path(name: str) -> str:
-    """Bare name -> calibrations/<name>.npz; a name that already contains a
-    path is used as-is (.npz appended either way if missing)."""
+    """Bare name -> calibrations/<name>.npz; an explicit path is used as-is."""
     if not name.endswith(".npz"):
         name += ".npz"
     if os.path.dirname(name):
@@ -113,18 +100,14 @@ class CursorFilter:
         return float(new_output[0]), float(new_output[1])
 
     def reset(self, crs_x: float, crs_y: float) -> None:
-        """Reinit history to steady-state at (crs_x, crs_y), so tracking
-        resumed after a gap doesn't overshoot on stale samples."""
+        """Reinit the filter at (crs_x, crs_y), e.g. when tracking resumes after a gap."""
         steady = np.array([crs_x, crs_y])
         self._in_history[:] = steady
         self._out_history[:] = steady
 
 
-# --- Autoencoder forward map parameters ---
-# Same architecture/hyperparameters as Naji's compute_bomi_map.Autoencoder.train_network,
-# as used for dr_mode="ae" in main_reaching_FullHand_MOD_ae.py's train_ae():
-# Input -> Dense(32, tanh) -> Dense(32, tanh) -> Dense(2, linear) [latent/cursor]
-#       -> Dense(32, tanh) -> Dense(32, tanh) -> Dense(n_features, linear) [reconstruction]
+# --- Autoencoder map (same architecture/hyperparameters as markerlessBoMI's dr_mode="ae") ---
+# Input -> Dense(32, tanh) -> Dense(32, tanh) -> Dense(2) [cursor] -> ... -> Dense(n_features)
 AE_N_STEPS = 3001      # training epochs (n_steps)
 AE_LR = 0.02           # Adam learning rate
 AE_HIDDEN_UNITS = 32   # nh1 = nh2
@@ -134,24 +117,9 @@ AE_LATENT_DIM = 2      # cu: 2 code units -> (crs_x, crs_y)
 
 
 class BoMIMap:
-    """
-    Autoencoder forward map: raw hand landmarks -> 2D cursor in screen space.
-
-    A dense autoencoder is trained on the raw landmark calibration samples
-    (reconstruction loss only, no separate normalization), and its 2-unit
-    latent layer is used standalone as the cursor space at inference time --
-    exactly the dr_mode="ae" path in Naji's BoMI pipeline
-    (compute_bomi_map.Autoencoder.train_network + reaching_functions.get_mapped_values).
-    Scale/offset map the latent codes' peak-to-peak range onto the screen size,
-    centered on the mean, same as train_ae()'s post-training step (with rot=0).
-
-    The screen-space map is stored as a single affine transform cu_screen = A @
-    cu_latent + b (A starts out diagonal, i.e. plain per-axis scale). customize()
-    folds an extra rotation/gain/offset -- the same operation as Naji's
-    rotation_custom/scale_custom/offset_custom in reaching_functions.get_mapped_values
-    -- into that same (A, b), so a customized map is still just a BoMIMap that
-    save_map_bomi/load_map_bomi handle unchanged.
-    """
+    """Autoencoder map: raw hand landmarks -> 2D cursor in screen space. The
+    encoder's 2-unit latent layer is the cursor; an affine transform (A, b)
+    scales it onto the screen and absorbs customize()'s rotation/gain/offset."""
 
     def __init__(self) -> None:
         self._w1 = self._b1 = None  # encoder layer 1 (Dense, tanh)
@@ -186,8 +154,7 @@ class BoMIMap:
         autoencoder.fit(x=X, y=X, epochs=AE_N_STEPS, verbose=0, batch_size=len(X), shuffle=False)
         print("Autoencoder training done.")
 
-        # Keep only the encoder half (first 3 Dense layers) for standalone inference,
-        # same as train_ae() only persisting weights1/2/3 + biases1/2/3.
+        # Only the encoder half is kept for inference
         dense_layers = [layer for layer in autoencoder.layers if layer.get_weights()]
         self._w1, self._b1 = dense_layers[0].get_weights()
         self._w2, self._b2 = dense_layers[1].get_weights()
@@ -206,32 +173,19 @@ class BoMIMap:
         self.fitted = True
 
     def transform(self, features: np.ndarray) -> tuple:
-        """
-        Autoencoder BoMI map: raw hand landmarks -> 2D cursor in screen space,
-        via the trained encoder's forward pass (2 tanh hidden layers + linear
-        latent layer), same as reaching_functions.get_mapped_values(dr_mode="ae").
-        Returns (crs_x, crs_y) in pixels, clipped to the screen size.
-        """
+        """Landmarks -> (crs_x, crs_y) in pixels, clipped to the screen."""
         h = np.tanh(np.dot(features, self._w1) + self._b1)
         h = np.tanh(np.dot(h, self._w2) + self._b2)
-        cu = np.dot(h, self._w3) + self._b3  # latent code == raw cursor position
-        cu = self._A @ cu + self._b  # map latent extent onto the screen size
+        cu = np.dot(h, self._w3) + self._b3   # latent code = raw cursor
+        cu = self._A @ cu + self._b           # onto the screen
         crs_x = float(np.clip(cu[0], 0, BASE_WIDTH))
         crs_y = float(np.clip(cu[1], 0, BASE_HEIGHT))
         return crs_x, crs_y
 
     def customize(self, rot_deg: float = 0.0, gain_x: float = 1.0, gain_y: float = 1.0,
                   off_x: float = 0.0, off_y: float = 0.0) -> None:
-        """
-        Compose an extra screen-space rotation/gain/offset on top of the current
-        map, exactly like Naji's rotation_custom/scale_custom/offset_custom
-        (applied in reaching_functions.get_mapped_values after the base AE/PCA
-        map): recentre on the screen middle, rotate (screen space is left-handed,
-        hence the sign flip), apply a per-axis gain -- negative flips that axis --
-        then offset. Composes into the same (A, b) used by transform(), so calling
-        this repeatedly (e.g. from a live tuning UI) keeps stacking correctly, and
-        the result is saved/loaded like any other BoMIMap.
-        """
+        """Compose a rotation (about the screen centre), per-axis gain (negative =
+        flip) and offset into (A, b); repeated calls stack."""
         center = np.array([BASE_WIDTH, BASE_HEIGHT]) / 2.0
         rad = -np.radians(rot_deg)  # left-handed screen space
         rot = np.array([[np.cos(rad), -np.sin(rad)], [np.sin(rad), np.cos(rad)]])
@@ -264,13 +218,10 @@ class BoMIMap:
 
 # --- Velocity helpers ---
 def check_region_cursor(crs_x: float, crs_y: float) -> int:
-    """
-    Returns region 1-9 based on 3x3 grid over BASE_WIDTH x BASE_HEIGHT.
-    Layout:
-        1 | 2 | 3   
-        4 | 5 | 6   
-        7 | 8 | 9   
-    """
+    """Region 1-9 of the 3x3 grid over BASE_WIDTH x BASE_HEIGHT:
+        1 | 2 | 3
+        4 | 5 | 6
+        7 | 8 | 9"""
     if crs_x < 847:
         col = 0
     elif crs_x <= 1697:
@@ -289,13 +240,8 @@ def check_region_cursor(crs_x: float, crs_y: float) -> int:
 
 
 def apply_region_velocity_mask(region: int, lin_vel: float, ang_vel: float) -> tuple:
-    """
-    Enforce active DOFs per region:
-      center (5)        -> stop
-      middle col (2, 8) -> linear only
-      middle row (4, 6) -> angular only
-      corners (1,3,7,9) -> both
-    """
+    """Active DOFs per region: centre (5) stop, middle column (2, 8) linear only,
+    middle row (4, 6) angular only, corners both."""
     if region == 5:
         return 0.0, 0.0
     if region in (2, 8):
@@ -306,8 +252,7 @@ def apply_region_velocity_mask(region: int, lin_vel: float, ang_vel: float) -> t
 
 
 def _ramped_axis_velocity(delta: float, half_extent: float, dead_zone_px: float, min_v: float, max_v: float) -> float:
-    """Signed velocity for one axis: 0 inside dead_zone_px of center, then
-    ramps linearly from min_v to max_v"""
+    """0 inside the dead zone, then linear ramp from min_v to max_v at the screen edge."""
     norm = delta / half_extent
     dead_zone_norm = dead_zone_px / half_extent
     magnitude = abs(norm)
@@ -328,12 +273,9 @@ def compute_dynamic_vel_from_cursor(
     dead_zone_px: float = DEAD_ZONE_PX,
     ang_right_is_negative: bool = True,
 ) -> tuple:
-    """
-    Linear/angular velocity from cursor position, each axis independent: 
-    0 inside dead_zone_px of screen center on that axis, then min_*..max_* 
-    linearly from there to the screen edge.
-    Up from center -> positive linear; right from center -> negative angular.
-    """
+    """(lin_vel, ang_vel) from the cursor, each axis independent: 0 within
+    dead_zone_px of the centre, then min..max linearly to the screen edge.
+    Up = positive linear, right = negative angular."""
     cx = BASE_WIDTH / 2.0
     cy = BASE_HEIGHT / 2.0
     dx = crs_x - cx
@@ -345,13 +287,9 @@ def compute_dynamic_vel_from_cursor(
     return lin_vel, ang_vel
 
 
-# --- Autoencoder forward map ---
+# --- Hand tracking / drawing ---
 def _extract_hand_features(hand_landmarks) -> np.ndarray:
-    """
-    Flatten all 21 hand landmarks (x, y) into a 42-element vector.
-    hand_landmarks is the list of NormalizedLandmark returned by MediaPipe
-    Tasks (e.g. results.hand_landmarks[0]).
-    """
+    """21 landmarks (x, y) -> 42-element feature vector."""
     coords = [[lm.x, lm.y] for lm in hand_landmarks]
     return np.array(coords).flatten()
 
@@ -375,9 +313,7 @@ def _draw_hand_landmarks(frame, landmarks) -> None:
 
 def draw_cursor_map(crs_x: float, crs_y: float, region: int, message: str,
                       map_width: int = 510, map_height: int = 300):
-    """Rectangle representing the BASE_WIDTH x BASE_HEIGHT virtual screen, with
-    the 9-region grid lines, a dot at the current cursor position, and the
-    lin_vel/ang_vel message currently being sent to the mobile base."""
+    """Cursor map: the 9-region grid, the cursor and the current velocity message."""
     canvas = np.full((map_height, map_width, 3), 30, dtype=np.uint8)
     sx = map_width / BASE_WIDTH
     sy = map_height / BASE_HEIGHT
@@ -400,11 +336,10 @@ def draw_cursor_map(crs_x: float, crs_y: float, region: int, message: str,
 
 
 def update_bomi_cursor(cap, landmarker, bomi_map: BoMIMap, cursor_filter: CursorFilter, crs_x: float, crs_y: float):
-    """One iteration of hand tracking: reads a webcam frame, runs the hand
-    landmarker, and returns (frame_with_landmarks, crs_x, crs_y, hand_detected).
-    Cursor position is carried over unchanged when no hand is detected;
-    hand_detected tells callers that drive the robot to stop instead of
-    coasting on a stale position."""
+    """One tracking iteration: read a frame, run the landmarker, map and filter.
+    Returns (frame with landmarks, crs_x, crs_y, hand_detected); the cursor is
+    left unchanged when no hand is detected, so callers that drive the robot
+    can stop instead of coasting on a stale position."""
     ret, frame = cap.read()
     if not ret:
         return None, crs_x, crs_y, False
@@ -425,8 +360,7 @@ def update_bomi_cursor(cap, landmarker, bomi_map: BoMIMap, cursor_filter: Cursor
 
 
 def map_bomi_to_frame(crs_x: float, crs_y: float, width: int, height: int) -> tuple:
-    """Rescale a cursor position from the BASE_WIDTH x BASE_HEIGHT BoMI screen
-    space into an arbitrary window's pixel space"""
+    """Cursor position -> pixel position in a width x height window."""
     return (
         int(crs_x / BASE_WIDTH * width),
         int(crs_y / BASE_HEIGHT * height),
@@ -442,8 +376,7 @@ def calibration_phase(cap, landmarker) -> list:
     print("Move your hand through all positions you intend to use.")
     print("SPACE = record sample   |   ENTER = finish (need >= 30)   |   Q = quit")
 
-    last_landmarks = None  # most recent detection, so a keypress landing on a
-                            # dropout frame (tracking flickers frame to frame) doesn't silently lose the sample
+    last_landmarks = None  # last detection, so a keypress on a dropout frame still records a sample
     while True:
         ret, frame = cap.read()
         if not ret:
@@ -487,16 +420,11 @@ def calibration_phase(cap, landmarker) -> list:
 def cursor_preview_phase(cap, landmarker, bomi_map: BoMIMap, cursor_filter: CursorFilter = None,
                            crs_x: float = None, crs_y: float = None, show_cam: bool = True,
                            on_frame=None, hold_seconds: float = 5.0) -> tuple:
-    """
-    Shows the same cursor/region view as the control phase, but lets the user 
-    where the cursor is before enabling motion.
-
-    Pass an existing cursor_filter/crs_x/crs_y to continue them; returns the 
-    final (crs_x, crs_y). 
-    - show_cam=False skips the raw camera/landmarks window 
-    entirely, for callers that only want the cursor map on screen. 
-    - on_frame, if given, is called with no arguments once per loop iteration.
-    """
+    """Same cursor map as Control but nothing is sent: lets the user get a feel
+    for the cursor. Ends once it has been held in region 5 for hold_seconds
+    (only while the hand is tracked). Pass an existing cursor_filter/crs_x/crs_y
+    to continue them; show_cam=False hides the webcam window; on_frame() is
+    called every iteration if given. Returns (crs_x, crs_y)."""
     cursor_filter = cursor_filter or CursorFilter()
     cam_window = CAM_WINDOW_NAME
     map_window = MAP_WINDOW_NAME
@@ -518,9 +446,7 @@ def cursor_preview_phase(cap, landmarker, bomi_map: BoMIMap, cursor_filter: Curs
             region = check_region_cursor(crs_x, crs_y)
 
         now = time.time()
-        # Only accrue while actively tracked and centered, so a dropped
-        # hand while the stale cursor happens to sit in region 5 can't
-        # silently trigger the switch.
+        # Only accrue while tracked and centred
         center_hold_start = (center_hold_start or now) if (hand_detected and region == 5) else None
         center_progress = min((now - center_hold_start) / hold_seconds, 1.0) if center_hold_start else 0.0
 
@@ -536,7 +462,7 @@ def cursor_preview_phase(cap, landmarker, bomi_map: BoMIMap, cursor_filter: Curs
         if show_cam:
             cv2.imshow(cam_window, frame)
         cv2.imshow(map_window, draw_cursor_map(crs_x, crs_y, region, "(preview - not sent)"))
-        cv2.moveWindow(map_window, *MAP_WINDOW_POS)  # a just-closed window can make the WM reclaim the position otherwise
+        cv2.moveWindow(map_window, *MAP_WINDOW_POS)  # re-pin, the WM can move it
         cv2.setWindowProperty(map_window, cv2.WND_PROP_TOPMOST, 1)  # re-pin (same-process windows only)
         safety.raise_window(map_window)  # actually wins over the cross-process fullscreen camera_viewer window
         if on_frame is not None:
@@ -549,8 +475,7 @@ def cursor_preview_phase(cap, landmarker, bomi_map: BoMIMap, cursor_filter: Curs
             print("Aborted.")
             sys.exit(0)
 
-    # Windows are intentionally left open so the same cam/map windows carry 
-    # straight into the control phase instead of flickering shut.
+    # Windows left open: they carry over into the control phase
     return crs_x, crs_y
 
 
